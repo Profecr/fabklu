@@ -1,0 +1,1805 @@
+/**
+ * postMessage protocol between an embedding host page and an iframe-mode block.
+ *
+ * Discriminated by `type`. Both directions share this module so producers and
+ * consumers stay in lockstep — adding a parent→block message means the block
+ * side gets a compile error until it handles the new variant (and vice versa).
+ *
+ * Wire format: `window.postMessage({ type, payload }, targetOrigin)`.
+ */
+
+import type { ColorDomain } from './browsingLevel.js';
+import type {
+  BlockCheckpointInfo,
+  BlockResourceInfo,
+  BlockResourcePickerType,
+  BlockUploadedImageInfo,
+  BlockGenerationSourceImageInfo,
+  BlockPendingImageInfo,
+  BlockImageScanResult,
+  BlockUploadPurpose,
+  BlockNavigateScope,
+  BlockContext,
+  BlockSettings,
+  Theme,
+  ViewerInfo,
+  WorkflowBody,
+  BlockWorkflowSnapshot,
+  BlockBuzzTransaction,
+  BlockBuzzAccount,
+  BlockDailyCompensationResource,
+  BlockViewer,
+  BlockWildcardPack,
+  BlockWildcardPackErrorCode,
+  AppWorkflow,
+  BlockGatedImage,
+  BlockCollectionFollowErrorCode,
+  BlockCollectionFollowResult,
+  BlockPostSource,
+  BlockCreatePostResult,
+  BlockTrainingDatasetItem,
+  BlockTrainingDatasetResult,
+  WorkflowBodyTraining,
+} from './types.js';
+
+// ============================================================
+// Buzz self-read request params (block → parent)
+// ============================================================
+
+/**
+ * Filter params for `GET_BUZZ_TRANSACTIONS`. All optional; the host validates
+ * them server-side (they are NEVER trusted for auth — the account is self-bound
+ * off the block token). Mirrors civitai/civitai's `getMyBuzzTransactionsInput`
+ * (`src/server/schema/buzz.schema.ts`) minus the host-injected `blockToken`.
+ */
+export interface BlockBuzzTransactionsParams {
+  /** Buzz pool to read (e.g. `'yellow'`, `'blue'`, `'cashSettled'`). Default `'yellow'` server-side. */
+  accountType?: string;
+  /** A `TransactionType` NAME (e.g. `'Tip'`); the host maps it to the numeric enum. */
+  type?: string;
+  /** Opaque page cursor — the ISO-8601 `cursor` a prior `BUZZ_TRANSACTIONS_RESULT` returned (`z.coerce.date` server-side). */
+  cursor?: string;
+  /** Window start (ISO-8601; `z.coerce.date` server-side). */
+  start?: string;
+  /** Window end (ISO-8601; `z.coerce.date` server-side). */
+  end?: string;
+  /** Page size, 1..200 (default 50 server-side). */
+  limit?: number;
+}
+
+/**
+ * Filter params for `QUERY_APP_WORKFLOWS` — the app generator SUBQUEUE read. Both
+ * optional; the host validates them server-side (the account + the per-app tag
+ * filter are host-forced off the block token — NEVER trusted from these). Mirrors
+ * civitai/civitai's `blocks.queryAppWorkflows` input (`blocks.router.ts`, PR
+ * #3164) minus the host-injected `blockToken`/`tags`.
+ */
+export interface AppWorkflowsParams {
+  /** Opaque keyset cursor — the `cursor` a prior `APP_WORKFLOWS_RESULT` returned (1..256 chars server-side). */
+  cursor?: string;
+  /** Page size, 1..50 (default 20 server-side). */
+  limit?: number;
+}
+
+/**
+ * Params for `GET_DAILY_COMPENSATION`. `date` is REQUIRED — the host reads the
+ * whole MONTH containing it. Mirrors civitai/civitai's
+ * `getMyDailyCompensationInput` minus the host-injected `blockToken`.
+ */
+export interface BlockDailyCompensationParams {
+  /** ISO-8601 date; the host reads the month containing it. Required (`z.coerce.date` server-side). */
+  date: string;
+  /** Compensation source (default `'compensation'` server-side). */
+  source?: string;
+  /** Restrict to one Buzz pool (optional). */
+  accountType?: string;
+}
+
+// ============================================================
+// Token wrapper (shared by BLOCK_INIT, TOKEN_REFRESH, TOKEN_REFRESH_RESPONSE)
+// ============================================================
+
+/**
+ * The wrapped token shape the host sends to the block. `raw` is the JWT;
+ * `scopes`, `expiresAt`, and `buzzBudget` are extracted from the JWT claims
+ * so blocks don't have to decode it themselves. `buzzBudget` is only present
+ * when the manifest declares `ai:write:budgeted`.
+ *
+ * Mirrors the `token` field shape in civitai/civitai's `IframeHost.tsx`.
+ */
+export interface WrappedToken {
+  raw: string;
+  scopes: string[];
+  /** ISO-8601; consumers rehydrate to Date. */
+  expiresAt: string;
+  buzzBudget?: number;
+}
+
+// ============================================================
+// Init payload
+// ============================================================
+
+/**
+ * Payload of the first `BLOCK_INIT` message a block receives. The host waits
+ * for both the iframe `load` event AND a minted token before sending this.
+ *
+ * Mirrors `BlockInitPayload` in civitai/civitai's
+ * `src/components/AppBlocks/types.ts`. Adding a field here without a
+ * matching change on the platform side (or vice versa) is the bug class
+ * `transport/validate.ts` exists to surface — keep the validator in lockstep
+ * with both sides.
+ */
+export interface BlockInitPayload {
+  blockInstanceId: string;
+  /**
+   * @deprecated A block knows its own `blockId` at BUILD time — it is the
+   * `blockId` in its own `block.manifest.json`. Receiving it again at init is
+   * parity surface with no consumer: across the 21 rows of the platform's
+   * `app_blocks` table, ZERO read it off `useBlockContext()`. Read your manifest
+   * instead.
+   *
+   * 🔴 STILL SENT, and it MUST be. This is a type-level deprecation ONLY.
+   * `isValidBlockInitPayload` — compiled into every already-built, already-
+   * deployed block bundle — rejects a payload whose `blockId` is not a non-empty
+   * string, and a rejected `BLOCK_INIT` is never ACKED.
+   *
+   * The host does retry, and retrying does not help. Both hosts drive the
+   * handshake with `IframeInitController`: one BLOCK_INIT immediately, then a
+   * re-post every `INIT_RETRY_INTERVAL_MS` (400ms) until `BLOCK_READY` —
+   * about 25 of them inside one `BLOCK_READY_TIMEOUT_MS` (10s) window.
+   *
+   * 🔴 Those re-posts are NOT byte-identical. `IframeHost` and `PageBlockHost`
+   * both re-point `buildInitPayloadRef.current` on EVERY render, precisely so a
+   * retry tick carries the freshest data (a checkpoint or showcase query that
+   * resolved after the controller started). What that freshness varies is
+   * query-resolved VALUES; it never adds back a field the host stopped putting
+   * on the wire. So a guard rejecting for a MISSING FIELD rejects every retry
+   * for the same reason — the structural conclusion holds, just not via
+   * "identical payload".
+   *
+   * What happens when the window closes is PER-SURFACE:
+   *  - MODEL SLOT (`IframeHost`) — no auto-retry. Status goes `timeout`,
+   *    `hostRenderDecision` returns `collapse`, and the host renders `null`, so
+   *    the slot takes no space. One handshake round; over at ~10s.
+   *  - PAGE HOST (`PageBlockHost`) — `timeout` is auto-retryable, and the budget
+   *    is `MAX_AUTO_RETRIES = 2` with `AUTO_RETRY_BACKOFF_MS = [2000, 5000]`
+   *    (`pageBlockHostLogic.ts`). Each automatic attempt disposes the controller,
+   *    remounts the iframe and builds a NEW controller, so it is a FULL fresh
+   *    handshake — ~25 more re-posts and a fresh 10s window each time. Three
+   *    rounds, ~37s of wall clock, before the terminal fallback with the
+   *    prominent manual Retry. (`worstReachableLaunchMs()` = 57s covers the
+   *    worse path where a token wait is also paid.)
+   *
+   * Either way the block never becomes ready. Removing this field from the wire
+   * is a fleet-wide outage, not a type change. It comes off the wire only once
+   * the deployed population is known to be running a validator that tolerates
+   * its absence.
+   */
+  blockId: string;
+  /**
+   * The OauthClient (app) this block belongs to.
+   *
+   * @deprecated Same reasoning and the SAME hard constraint as
+   * {@link BlockInitPayload.blockId} — build-time identity, zero deployed
+   * readers, still sent because the deployed validator requires it.
+   */
+  appId: string;
+  token: WrappedToken;
+  context: BlockContext;
+  settings: BlockSettings;
+  /**
+   * `null` when the viewer is anonymous; otherwise a {@link ViewerInfo} whose
+   * `signedIn` is the field to read — `id`/`username` are deprecated
+   * init-time identity disclosure. The OBJECT-OR-NULL shape is load-bearing for
+   * deployed blocks; see {@link ViewerInfo}.
+   */
+  viewer: ViewerInfo | null;
+  theme: Theme;
+  renderMode: 'iframe' | 'inline';
+  /**
+   * The color-domain the block is rendered inside (`green` | `blue` | `red`),
+   * or `null` when the host did not resolve one. Informational ONLY — the SFW
+   * policy is server-side; never gate on this string. Resolve the ceiling
+   * first, then test it — in any runtime:
+   *
+   * ```ts
+   * const eff = effectiveBrowsingCeiling(maxBrowsingLevel, effectiveBrowsingLevel);
+   * // 🔴 OPPOSITE POLARITIES — do not copy these two lines as a uniform pair.
+   * if (isSfwCeiling(eff)) hideMatureAffordances();     // true = SFW  ⇒ HIDE
+   * if (isLevelAllowed(BrowsingLevel.R, eff)) showR();  // true = allowed ⇒ SHOW
+   * ```
+   *
+   * 🔴 `effectiveBrowsingCeiling` returns a BITMASK, not a boolean — an SFW
+   * ceiling is `3`, which is truthy, so branching on it directly shows mature
+   * content to a viewer who may not see it. It needs one of the two predicates
+   * above. In React, `@civitai/blocks-react`'s `useDomainMaturity()` returns
+   * `isSfw` / `isLevelAllowed` already composed this way.
+   *
+   * Sent by civitai/civitai PR #2670. A host that predates it omits this field
+   * (reads `undefined`).
+   */
+  domain?: ColorDomain | null;
+  /**
+   * Authoritative browsing-level BITMASK = the max NSFW levels the domain
+   * allows, computed server-side from `domainBrowsingCeiling(color)` (green/
+   * blue → SFW, red → all). Bits mirror the server `NsfwLevel` (see
+   * `browsingLevel.ts`). `isSfwCeiling(maxBrowsingLevel)` answers "is this
+   * DOMAIN SFW?" — not "may I show THIS viewer mature content"; for that, see
+   * the warning below and {@link effectiveBrowsingLevel}.
+   *
+   * Sent by civitai/civitai PR #2670. A host that predates it omits this field
+   * (reads `undefined`); the SDK fail-closes to SFW when it is absent.
+   *
+   * 🔴 THIS IS A PROPERTY OF THE DOMAIN, NOT OF THE PERSON LOOKING. Every
+   * viewer on `civitai.red` receives the same maximally-wide value, including
+   * one whose own NSFW setting is off — so this cannot answer "may I show THIS
+   * viewer mature content". {@link effectiveBrowsingLevel} can.
+   */
+  maxBrowsingLevel?: number;
+  /**
+   * {@link maxBrowsingLevel} intersected with the VIEWER's own browsing-level
+   * setting — the one they choose with the NSFW control in the civitai site
+   * header. This is what a block should render mature affordances against:
+   * `maxBrowsingLevel` says what the DOMAIN permits anybody, this says what
+   * THIS person may be shown here.
+   *
+   * 🔴 ALWAYS A SUBSET OF {@link maxBrowsingLevel} — never a superset, and the
+   * platform enforces that twice (at the token mint, and again in the host's
+   * `projectBlockInitMaturity` projection). Two consequences worth internalising:
+   *
+   *   1. A block cannot widen its own ceiling by reading this instead. If you
+   *      were gating on `maxBrowsingLevel`, switching to this can only ever show
+   *      the viewer LESS.
+   *   2. The viewer's RAW level is deliberately never sent, and you should not
+   *      try to reconstruct it. On `blue` the App-Blocks domain ceiling is SFW
+   *      while a viewer's saved level may carry R/X/XXX — so the raw value is
+   *      WIDER than the domain permits and is not permission for anything.
+   *
+   * ADDITIVE + OPTIONAL. A host that predates it omits the field, in which case
+   * the ceiling falls back to {@link maxBrowsingLevel} — i.e. exactly the
+   * behaviour that host already had. Do not read this field directly: pass it
+   * through `effectiveBrowsingCeiling`, which applies that fallback and the
+   * fail-closed defaults for you. `@civitai/blocks-react`'s
+   * `useDomainMaturity()` is the React wrapper over the same thing — it is one
+   * way to get this right, not the only one, since this module is
+   * runtime-agnostic and several starters — the Civitai App starter among
+   * them — ship without React.
+   */
+  effectiveBrowsingLevel?: number;
+}
+
+// ============================================================
+// Shared storage (App Blocks SHARED datastore, W?-Phase 2)
+// ============================================================
+
+/**
+ * The freeform value carried by one SHARED-storage entry. Unlike the per-user
+ * `APP_STORAGE_*` KV (arbitrary JSON), the SHARED store is a structured,
+ * append-only, community-votable list — every entry is a `{ title, body? }`
+ * record contributed by one viewer and vote-counted across all viewers. `title`
+ * is required; `body` is optional long-form.
+ */
+export interface SharedStorageValue {
+  title: string;
+  body?: string;
+  /**
+   * Optional, opaque, app-owned structured payload stored alongside the
+   * moderated `title`/`body`. Mirrors civitai's merged shared-storage `data`
+   * jsonb (`appendValueInput.data`). UNMODERATED — the content-safety belt runs
+   * on `title`/`body` only, so apps MUST keep ALL user-visible TEXT in
+   * `title`/`body` and place ONLY opaque app structure here (e.g. a serialized
+   * generator spec / settings blob). Counts toward the per-value byte cap + the
+   * per-app quota. Omit when the entry carries no structured payload.
+   */
+  data?: unknown;
+}
+
+/**
+ * One SHARED-storage entry as it appears on the wire in `SHARED_LIST_RESULT`.
+ * `createdAt`/`updatedAt` are ISO-8601 strings; the block-side hook rehydrates
+ * them to `Date` (mirrors `APP_STORAGE_LIST_RESULT`'s `updatedAt`). `count` is
+ * the current vote total; `authorUserId` is the contributing viewer.
+ */
+export interface SharedStorageItemWire {
+  key: string;
+  authorUserId: number;
+  value: SharedStorageValue;
+  count: number;
+  /** ISO-8601; consumers rehydrate to Date. */
+  createdAt: string;
+  /** ISO-8601; consumers rehydrate to Date. */
+  updatedAt: string;
+  /**
+   * Whether the REQUESTING viewer has an active up-vote on this entry. Lets a
+   * block hydrate its vote-button state on load instead of guessing (fixes the
+   * "double-click to unvote" bug). ADDITIVE + OPTIONAL: a host that predates
+   * this field omits it — the block-side hook defaults a missing value to
+   * `false`, so a new block on an old host degrades to today's behavior. An
+   * anonymous viewer is always `false` (no per-viewer vote row). Resolved
+   * server-side per viewer; never client-trusted.
+   */
+  viewerVoted?: boolean;
+}
+
+// ============================================================
+// Parent → block
+// ============================================================
+
+/**
+ * Why a `CONSENT_UNAVAILABLE` push was sent.
+ *
+ * A NAMED ALIAS for the single literal `'ungrantable'` — and it is exactly that,
+ * a bare literal type, not a wider `string` and not (yet) a multi-member union.
+ * `expectTypeOf<ConsentUnavailableReason>().toEqualTypeOf<'ungrantable'>()` in
+ * `test/blocks/consent-unavailable.test-d.ts` pins that.
+ *
+ * WHY THE ALIAS EARNS ITS KEEP, given it is currently just the literal:
+ *  - It gives the value a name consumers can spell in their own signatures
+ *    (`function refusalCopy(reason: ConsentUnavailableReason)`) instead of
+ *    repeating a string literal at every call site, and it is the ONE place a
+ *    future member is added.
+ *  - It is deliberately NOT `string`. `string` would leave a consumer nothing to
+ *    narrow on and no compile-time signal at all when the vocabulary changes.
+ *
+ * 🔴 AND IT DOES NOT MAKE WIDENING SOURCE-COMPATIBLE — do not read it that way.
+ * Adding a second member is a BREAKING change for any consumer with an
+ * exhaustive `switch` (or a `never` default arm): those stop compiling, on
+ * purpose, which is the whole value of a literal union and the reason it is
+ * preferred to `string` here. Ship a second reason as a documented breaking
+ * change, not as a "safe additive" one.
+ *
+ * `'ungrantable'` — the requested scope was clamped/withheld at mint, so no
+ * consent round-trip in THIS environment can ever add it. Distinct from "the
+ * viewer has not confirmed the dialog yet", which produces no message at all.
+ */
+export type ConsentUnavailableReason = 'ungrantable';
+
+/**
+ * Payload of the host→block {@link ParentToBlockMessage} `CONSENT_UNAVAILABLE`
+ * push — the host telling a block that a `REQUEST_CONSENT` it sent can NEVER be
+ * granted here, so the block can stop telling the user to retry.
+ *
+ * 🔴 `scopes` MAY BE EMPTY. It is the host's own refused set filtered to the
+ * known block-scope vocabulary ({@link BLOCK_SCOPES}) — the request's `scopes`
+ * hint is untrusted block input, and this payload is rendered by block UI, so
+ * nothing outside that fixed vocabulary is echoed back out of the host. The
+ * decision to refuse is taken on the UNFILTERED set, so a request naming only
+ * unrecognised scopes still refuses out loud, with `scopes: []`. Treat the
+ * message itself as the signal and `scopes` as an advisory detail for copy.
+ */
+export interface ConsentUnavailablePayload {
+  reason: ConsentUnavailableReason;
+  /** Refused scopes safe to NAME back to the block. MAY be empty — see above. */
+  scopes: string[];
+}
+
+/**
+ * Host→block messages.
+ *
+ * ## The `{ ok, error }` reply contract
+ *
+ * On every reply payload below that carries an `ok` boolean, `ok` — and any
+ * success-only sibling such as `deleted` — is OPTIONAL, because an error reply
+ * is `{ requestId, error }` on its own: the host is not obliged to also send
+ * `ok: false`. This mirrors the block-side guards in `@civitai/blocks-react`'s
+ * `src/transport/validate.ts`, which early-accept any reply carrying an `error`
+ * and only then require `ok`. Keep the two in lockstep: a guard that admits a
+ * payload the type declares as guaranteed hands the consuming hook a lie.
+ *
+ * Consumers must therefore treat a PRESENT `error` (not a truthy one) as the
+ * reject signal before reading any success-only field.
+ */
+export type ParentToBlockMessage =
+  | { type: 'BLOCK_INIT'; payload: BlockInitPayload }
+  | {
+      // Host-pushed token rotation (~every 13min). No `requestId` — the
+      // host is the initiator. Blocks must apply the new wrapped token
+      // unconditionally; this is also what keeps the iframe alive across
+      // refreshes (no remount).
+      type: 'TOKEN_REFRESH';
+      payload: { token: WrappedToken };
+    }
+  | {
+      // Reply to a block-initiated `REQUEST_TOKEN`. The payload otherwise
+      // mirrors `TOKEN_REFRESH` so consumers can apply both through the same
+      // path.
+      //
+      // `requestId` is REQUIRED as of v2 (it was `requestId?: string`).
+      //
+      // WHY: a reply that may not name its request is not usable as a reply. A
+      // React consumer never noticed because the SDK also applies the token to
+      // the snapshot as a side effect — but `useBlockToken().refresh()` awaits
+      // the CORRELATED reply, and the transport matches a pending request
+      // strictly by `requestId`. So a response without one has ALWAYS failed to
+      // resolve `refresh()`, which then rejects on its 30s timeout while the
+      // token silently updates underneath. For a non-React consumer building
+      // straight against the wire there is no side channel at all: the reply is
+      // simply unattributable. Requiring the field documents what already had
+      // to be true, and lets the host's own tests enforce it.
+      //
+      // The host (civitai/civitai `IframeHost.tsx` / `PageBlockHost.tsx`) now
+      // echoes it unconditionally. Previously both spread it in only via
+      // `...(requestId ? { requestId } : {})` — a TRUTHINESS test, so an empty
+      // string was dropped too.
+      //
+      // 🔴 BACK-COMPAT, AND WHY THE GUARD STAYS LOOSE. `isValidTokenRefreshResponse`
+      // deliberately does NOT require `requestId`, so this type is stricter than
+      // the guard. That asymmetry is intentional: against an OLDER host that
+      // omits the field, a strict guard would DROP the message, and dropping it
+      // is strictly worse than today — the block would lose the token update it
+      // currently still gets, on top of the `refresh()` rejection it already
+      // gets. Tightening the guard would convert a degraded path into a broken
+      // one. The type is a contract on the HOST; the guard is a defence against
+      // the wire.
+      type: 'TOKEN_REFRESH_RESPONSE';
+      payload: { requestId: string; token: WrappedToken };
+    }
+  | {
+      // Host-pushed SITE-THEME change. Sent when the viewer toggles light/dark
+      // WHILE the block is mounted. No `requestId` — the host is the initiator,
+      // exactly like `TOKEN_REFRESH`; blocks apply the new theme unconditionally
+      // and there is no reply.
+      //
+      // WHY IT EXISTS: `theme` reaches a block twice at startup — in the
+      // `BLOCK_INIT` payload and (when the host enables the fast path) in the
+      // iframe URL fragment. Neither can change afterwards: `BLOCK_INIT` is
+      // DEDUPED by the SDK transport (only the first is honored) and the
+      // fragment is deliberately FROZEN at mount so a toggle cannot re-navigate
+      // a third-party frame. So before this message a mounted block kept
+      // rendering its mount-time theme until it was reloaded.
+      //
+      // BACK-COMPAT, BOTH DIRECTIONS — purely additive:
+      //   • OLD BLOCK / NEW HOST: an SDK that predates this message has no
+      //     handler for it. The iframe transport's `handleMessage` falls through
+      //     to its no-op tail (it is not a `BLOCK_INIT`, not a `TOKEN_REFRESH`,
+      //     carries no `requestId` so it matches no pending request, and has no
+      //     push listener), so a deployed block is COMPLETELY unaffected — it
+      //     simply keeps today's mount-time theme.
+      //   • NEW BLOCK / OLD HOST: nothing here is ever awaited. A block reads the
+      //     theme from its snapshot, which `BLOCK_INIT` already seeded; a host
+      //     that never sends `THEME_CHANGE` just means the value never moves —
+      //     i.e. today's behaviour. No hook blocks on it and there is no timeout
+      //     to hit.
+      type: 'THEME_CHANGE';
+      payload: { theme: Theme };
+    }
+  | {
+      // Host-pushed ROUTE change — the host telling a PAGE block which sub-path
+      // below the app root is now showing. No `requestId`; this is an
+      // uncorrelated host→block PUSH, exactly like `TOKEN_REFRESH` /
+      // `THEME_CHANGE`, and there is no reply.
+      //
+      // WHY IT EXISTS: the page surface owns the browser history, not the block.
+      // A block asks for a move with `NAVIGATE` (`scope: 'app'`, the default),
+      // the host pushes it SHALLOWLY so the frame stays mounted — and then the
+      // only thing that has changed, from the block's side, is a value it was
+      // handed once at init. `BLOCK_INIT` is DEDUPED by the SDK transport, so a
+      // second init cannot carry the new value; before this message a block
+      // could move the host's URL and never learn where it had gone. That is
+      // civitai#5209's failure shape: the URL moves and nothing renders.
+      //
+      // It also covers the moves a block did NOT ask for — the viewer's own
+      // back/forward, and a deep link resolved after init.
+      //
+      // 🔴 THE FIRST VALUE DOES NOT COME OVER THIS MESSAGE, and a consumer that
+      // waits for one waits forever on an app's own index. The host sends the
+      // initial sub-path in `BLOCK_INIT.context.subPath`
+      // ({@link PageSlotContext}) and sends THIS message only when the resolved
+      // sub-path CHANGES after init (civitai/civitai `PageBlockHost.tsx`:
+      // `if (!initSentRef.current || status !== 'ready') return;`, deps
+      // `[subPath, status, send]`). So the message is a DELTA on a value that is
+      // already seeded — which is why the block-side surface is a hook that
+      // returns the CURRENT sub-path (`useCivitaiRoute`) rather than a
+      // change-callback: a callback alone cannot see the init value, and a
+      // change that lands before its subscription effect runs is lost.
+      //
+      // `subPath` is `''` on the app's own index — present and empty, never
+      // absent — and carries NO leading slash, matching the field it updates.
+      //
+      // ONLY THE PAGE SLOT EVER RECEIVES IT. A model slot has no route of its
+      // own, and the host's effect lives in `PageBlockHost`; there is no
+      // `subPath` on {@link ModelSlotContext} for it to update.
+      //
+      // BACK-COMPAT, BOTH DIRECTIONS — purely additive:
+      //   • OLD BLOCK / NEW HOST: an SDK that predates this message has no
+      //     handler for it — not `BLOCK_INIT`, not `TOKEN_REFRESH`, no
+      //     `requestId` to match a pending request, no push listener — so it
+      //     falls through the transport's no-op tail. Deployed page blocks keep
+      //     today's behaviour: the sub-path they got at init, forever.
+      //   • NEW BLOCK / OLD HOST: nothing awaits this message. A host that never
+      //     sends it just means the value never moves — i.e. today. No hook
+      //     blocks on it and there is no timeout to hit.
+      type: 'ROUTE_CHANGED';
+      payload: { subPath: string };
+    }
+  | {
+      // Host-pushed REFUSAL of a `REQUEST_CONSENT` that can NEVER be granted.
+      // No `requestId` — this is an uncorrelated host→block PUSH, exactly like
+      // `TOKEN_REFRESH` / `THEME_CHANGE`, NOT a `*_RESULT` reply. It cannot be
+      // one: `REQUEST_CONSENT` is fire-and-forget and carries no `requestId`, so
+      // there is nothing for a reply to correlate against.
+      //
+      // WHY IT EXISTS: a block asks for a consent-gated scope with
+      // `REQUEST_CONSENT`. The host has two very different reasons to grant
+      // nothing — the viewer simply has not confirmed the dialog YET, or the
+      // scope was clamped/withheld at mint and consent here can never add it.
+      // Before this message the second case produced only a toast in the HOST
+      // frame and nothing at all over the bridge, so the block could not tell
+      // them apart: its own UI went on telling the user to click Generate again
+      // for a permission that could never arrive, directly contradicting the
+      // host toast on the same screen.
+      //
+      // 🔴 `scopes` CAN LEGITIMATELY BE EMPTY, and that is NOT an error. The host
+      // decides to refuse on its own UNFILTERED un-grantable set, then filters
+      // the NAMES it puts on the wire to the known block-scope vocabulary
+      // ({@link BLOCK_SCOPES}) — the block's `scopes` hint is untrusted input and
+      // this payload is rendered by block UI. When nothing the block asked for is
+      // in that vocabulary the message is still sent, with `scopes: []`, meaning
+      // "refused, and none of the requested names are ones I will repeat back".
+      // The REFUSAL is the signal; the names are advisory. A consumer that
+      // branches on `scopes.length > 0` and ignores the empty case silently drops
+      // the very refusal it subscribed for.
+      //
+      // BACK-COMPAT, BOTH DIRECTIONS — purely additive:
+      //   • OLD BLOCK / NEW HOST: an SDK that predates this message has no
+      //     handler for it — not `BLOCK_INIT`, not `TOKEN_REFRESH`, no
+      //     `requestId` to match a pending request, no push listener — so it
+      //     falls through the transport's no-op tail. Deployed blocks are
+      //     unaffected; they keep today's (silent) behaviour.
+      //   • NEW BLOCK / OLD HOST: nothing awaits this message. A host that never
+      //     sends it just means the refusal stays invisible — i.e. today. No hook
+      //     blocks on it and there is no timeout to hit.
+      type: 'CONSENT_UNAVAILABLE';
+      payload: ConsentUnavailablePayload;
+    }
+  | { type: 'ESTIMATE_RESULT'; payload: { requestId: string; snapshot: BlockWorkflowSnapshot } }
+  | { type: 'WORKFLOW_SUBMITTED'; payload: { requestId: string; snapshot: BlockWorkflowSnapshot } }
+  | { type: 'WORKFLOW_STATUS'; payload: { requestId: string; snapshot: BlockWorkflowSnapshot } }
+  | { type: 'WORKFLOW_CANCELED'; payload: { requestId: string; snapshot: BlockWorkflowSnapshot } }
+  | {
+      type: 'BUZZ_PURCHASE_RESULT';
+      payload: { requestId: string; purchased: boolean; newBalance?: number };
+    }
+  | {
+      // Reply to GET_BUZZ_BALANCE. On success `balance` carries the viewer's
+      // per-pool balance ({ blue, green, yellow }); on host-side failure (or an
+      // anonymous viewer / missing scope) `error` is set and `balance` is
+      // absent. Mirrors the `APP_STORAGE_GET_RESULT` value-or-error convention:
+      // consumers treat a non-empty `error` as the failure signal.
+      type: 'BUZZ_BALANCE_RESULT';
+      payload: {
+        requestId: string;
+        balance?: { blue: number; green: number; yellow: number };
+        error?: string;
+      };
+    }
+  | {
+      // Reply to GET_VIEWER — the viewer self-read. On success `viewer` carries
+      // the signed-in viewer ({@link BlockViewer} — id/username/status/buzzBudget,
+      // where `username` + `buzzBudget` are present-but-NULLABLE); on host-side
+      // failure (anonymous / banned viewer, missing scope, or host failure)
+      // `error` is a FREE-TEXT string and `viewer` is absent. Consumers treat a
+      // non-empty `error` as the reject signal (mirrors BUZZ_BALANCE_RESULT).
+      type: 'VIEWER_RESULT';
+      payload: {
+        requestId: string;
+        viewer?: BlockViewer;
+        error?: string;
+      };
+    }
+  | {
+      // Reply to GET_BUZZ_TRANSACTIONS — the Buzz-dashboard ledger read. On
+      // success `result` carries the page (`cursor` for the next page +
+      // `transactions`); on host-side failure `error` is a FREE-TEXT string
+      // (the host forwards `err.message`, e.g. a missing-scope / rate-limit
+      // message) and `result` is absent. Consumers treat a non-empty `error`
+      // as the reject signal (mirrors BUZZ_BALANCE_RESULT). See the DATE WIRE
+      // CAVEAT on {@link BlockBuzzTransaction} — `cursor` + each `date` arrive
+      // as a `Date` INSTANCE today (raw structured-clone), not an ISO string;
+      // the block-side guard + hook tolerate both.
+      type: 'BUZZ_TRANSACTIONS_RESULT';
+      payload: {
+        requestId: string;
+        result?: { cursor?: string; transactions: BlockBuzzTransaction[] };
+        error?: string;
+      };
+    }
+  | {
+      // Reply to GET_BUZZ_ACCOUNTS — the viewer's all-pool balances (spendable
+      // pools + creator payout pools). Success → `result.accounts`; host-side
+      // failure → a free-text `error` (same convention as BUZZ_TRANSACTIONS).
+      type: 'BUZZ_ACCOUNTS_RESULT';
+      payload: {
+        requestId: string;
+        result?: { accounts: BlockBuzzAccount[] };
+        error?: string;
+      };
+    }
+  | {
+      // Reply to GET_DAILY_COMPENSATION — per-modelVersion generation earnings
+      // for the month of the requested `date`. Success → `result` ({ resources,
+      // hasPublishedResources }); host-side failure → a free-text `error`.
+      type: 'DAILY_COMPENSATION_RESULT';
+      payload: {
+        requestId: string;
+        result?: { resources: BlockDailyCompensationResource[]; hasPublishedResources: boolean };
+        error?: string;
+      };
+    }
+  | {
+      // Reply to GET_WILDCARD_PACK — the parsed wildcard pack the host resolved,
+      // fetched, unzipped, and parsed AS THE USER. Success → `pack`; failure →
+      // `error` a DISCRIMINATED ENUM ({@link BlockWildcardPackErrorCode}), NOT a
+      // free-text string (unlike the buzz bridges). Consumers switch on the code
+      // (`not-found`/`forbidden`/`too-large`/`parse-failed`/`busy`); `busy` is a
+      // retryable host-side backpressure signal.
+      type: 'WILDCARD_PACK_RESULT';
+      payload: {
+        requestId: string;
+        pack?: BlockWildcardPack;
+        error?: BlockWildcardPackErrorCode;
+      };
+    }
+  | {
+      // Reply to QUERY_APP_WORKFLOWS — the app generator SUBQUEUE page (the
+      // calling app's OWN tag-scoped generations, newest-first). On success
+      // `result` carries the page (`workflows` + the next-page `cursor`, which is
+      // `null` on the last/only page); on host-side failure `error` is a FREE-TEXT
+      // string (the host forwards `err.message`, e.g. a missing-scope / rate-limit
+      // message) and `result` is absent. Consumers treat a non-empty `error` as
+      // the reject signal (mirrors BUZZ_TRANSACTIONS_RESULT).
+      type: 'APP_WORKFLOWS_RESULT';
+      payload: {
+        requestId: string;
+        result?: { workflows: AppWorkflow[]; cursor: string | null };
+        error?: string;
+      };
+    }
+  | {
+      // Reply to PUBLISH_GENERATION_OUTPUTS. On success `result.imageIds` are the
+      // bare (post-less) scanned Image row ids created (order matches the resolved
+      // outputs). On host-side failure (anon / missing scope / not-owned workflow /
+      // rate-limit / upload/scan failure) `error` is a FREE-TEXT string and
+      // `result` is absent. Consumers treat a non-empty `error` as the reject
+      // signal (mirrors APP_WORKFLOWS_RESULT).
+      type: 'PUBLISH_RESULT';
+      payload: { requestId: string; result?: { imageIds: number[] }; error?: string };
+    }
+  | {
+      // Reply to CREATE_POST_FROM_APP. On success `result` carries the created
+      // Post's `postId`, its `url` on civitai, and `imageIds` — the ids of the
+      // images the post is made of, in post order (a `published` source
+      // contributes the id it named; a `workflow` source contributes the id of
+      // the Image row this call created for it).
+      //
+      // 🔴 `error` IS A FREE-TEXT STRING AND THE VALIDATOR MUST STAY SHAPE-ONLY.
+      // The host emits its OWN refusal codes here (`review-mode`, `block is not
+      // ready`, `sign in to post`, `no images to post`, `no block token`,
+      // `declined`) AND forwards any server message verbatim — a rate limit, a
+      // blocked title, a refused gallery attach. Constraining this to a set
+      // would DROP every server failure at the transport, before correlation,
+      // and a dropped reply on a REQUEST-style message does not reject: it
+      // leaves the promise pending until its own timer fires, which for this
+      // consent-gated message is TEN MINUTES. See
+      // `isValidCollectionFollowResult` in @civitai/blocks-react for the same
+      // decision and the counter-precedent it is taken against.
+      //
+      // `error: 'declined'` specifically GUARANTEES no post was created — the
+      // host's settlement latch is what makes that true even when the viewer
+      // dismisses the dialog mid-write.
+      type: 'CREATE_POST_RESULT';
+      payload: {
+        requestId: string;
+        result?: BlockCreatePostResult;
+        error?: string;
+      };
+    }
+  | {
+      // Reply to PREPARE_TRAINING_DATASET. On success `result` carries the
+      // opaque `datasetId`, the server-derived `count` of ADMITTED images and
+      // the `rejected` ones with their reasons.
+      //
+      // 🔴 `error` IS A FREE-TEXT STRING AND THE VALIDATOR MUST STAY SHAPE-ONLY,
+      // for the reason given on CREATE_POST_RESULT: the host's own codes
+      // (`BlockPrepareTrainingDatasetHostError`) share the field with any server
+      // message it forwards (`training from apps is not enabled`, a rate limit,
+      // a refused caption), and a membership check would drop those replies at
+      // the transport, leaving the request to its timer.
+      type: 'TRAINING_DATASET_RESULT';
+      payload: {
+        requestId: string;
+        result?: BlockTrainingDatasetResult;
+        error?: string;
+      };
+    }
+  | {
+      // Reply to RUN_TRAINING. On success `snapshot` is the submitted training
+      // workflow (poll it with POLL_WORKFLOW / `useBuzzWorkflow().watch()`).
+      //
+      // 🔴 `error` IS FREE TEXT, SHAPE-CHECKED ONLY — same reason as above, and
+      // the timer a dropped reply would leave running here is the TEN-MINUTE
+      // consent bound. Two host codes carry money meaning (see
+      // `BlockRunTrainingHostError`): `declined` GUARANTEES no run was
+      // submitted; `submission-unconfirmed` means the run MAY be running and
+      // charged.
+      type: 'TRAINING_RESULT';
+      payload: {
+        requestId: string;
+        snapshot?: BlockWorkflowSnapshot;
+        error?: string;
+      };
+    }
+  | {
+      // Reply to GET_IMAGES_BY_IDS. On success `result.images` is the per-viewer
+      // gated projection (`BlockGatedImage[]`; unresolvable ids omitted). On host-
+      // side failure `error` is a FREE-TEXT string and `result` is absent.
+      type: 'IMAGES_RESULT';
+      payload: { requestId: string; result?: { images: BlockGatedImage[] }; error?: string };
+    }
+  | {
+      // Reply to SET_COLLECTION_FOLLOW. Exactly ONE of `result` / `error` is
+      // present, and the host replies EXACTLY ONCE on every terminal path
+      // (refusal / lookup failure / cancel / success / server error) — a
+      // REQUEST-style message that gets no reply hangs the block to its SDK
+      // timeout.
+      //
+      // On success `result` echoes what the host wrote. On failure `error` is
+      // EITHER one of the closed {@link BlockCollectionFollowErrorCode} host
+      // refusals OR a FREE-TEXT server message (the host forwards `err.message`
+      // from the collection service — e.g. a FORBIDDEN on a private collection).
+      // 🔴 So `error` is NOT a discriminated enum the way `WILDCARD_PACK_RESULT`'s
+      // is: test for a code by equality and treat anything else as opaque.
+      //
+      // 🔴 `error: 'declined'` MEANS NO WRITE OCCURRED. The host takes its
+      // consent latch synchronously, before any await, precisely so a dismissal
+      // arriving mid-flight cannot claim `declined` for a follow that landed.
+      type: 'COLLECTION_FOLLOW_RESULT';
+      payload: {
+        requestId: string;
+        result?: BlockCollectionFollowResult;
+        error?: BlockCollectionFollowErrorCode | string;
+      };
+    }
+  | {
+      // Reply to CANCEL_APP_WORKFLOW — the terminal (canceled) projection of the
+      // one workflow the block canceled in its OWN subqueue. On success `result`
+      // carries the re-read `workflow`; on host-side failure (FORBIDDEN — not in
+      // this app's subqueue / not owned — or a transport error) `error` is a
+      // FREE-TEXT string and `result` is absent. Same value-or-error convention as
+      // APP_WORKFLOWS_RESULT.
+      type: 'CANCEL_APP_WORKFLOW_RESULT';
+      payload: {
+        requestId: string;
+        result?: { workflow: AppWorkflow };
+        error?: string;
+      };
+    }
+  | {
+      // Reply to OPEN_CHECKPOINT_PICKER. `selected` is absent when the user
+      // dismissed the picker without choosing — the block's hook resolves
+      // to `{ selected: undefined }` in that case.
+      type: 'CHECKPOINT_PICKER_RESULT';
+      payload: { requestId: string; selected?: BlockCheckpointInfo };
+    }
+  | {
+      // Reply to OPEN_RESOURCE_PICKER (the PAGE resource picker). `selected` is
+      // absent when the user dismissed without choosing — the block's hook
+      // resolves to `null`. The payload is the narrow `BlockResourceInfo`
+      // projection ONLY; the iframe never receives a list or the catalog.
+      type: 'RESOURCE_PICKER_RESULT';
+      payload: { requestId: string; selected?: BlockResourceInfo };
+    }
+  | {
+      // Reply to OPEN_IMAGE_UPLOAD (the host-mediated block image upload).
+      // `selected` is absent when the user dismissed the upload modal without a
+      // successful upload — the block's hook resolves to `null`. The iframe never
+      // handles the bytes. Mirrors the OPEN_RESOURCE_PICKER host-chrome pattern.
+      //
+      // `selected` is a UNION keyed by the request's `purpose` (+ `asyncScan`):
+      //   • `'display'` (default), BLOCKING: a MODERATED public image
+      //     ({@link BlockUploadedImageInfo} — imageId/nsfwLevel/contentRating/url,
+      //     scanned clean, within the SFW ceiling, unflagged).
+      //   • `'display'` + `asyncScan: true`: an EARLY-RESOLVE
+      //     ({@link BlockPendingImageInfo} — `status:'pending'`, imageId, url) that
+      //     resolves the modal on PERSIST (before the scan). The scan verdict
+      //     streams later on `IMAGE_SCAN_RESOLVED`. `status:'pending'` is the
+      //     on-wire discriminant vs the moderated shape.
+      //   • `'generationSource'`: an UNSCANNED private img2img source
+      //     ({@link BlockGenerationSourceImageInfo} — only { url, width, height };
+      //     no imageId/nsfwLevel, scanned by the orchestrator at gen time).
+      // The variant the host returns matches the `purpose`/`asyncScan` the block
+      // requested; narrow structurally (`'status' in selected` for pending, then
+      // `'imageId' in selected`) when a block uses more than one.
+      type: 'IMAGE_UPLOAD_RESULT';
+      payload: {
+        requestId: string;
+        selected?:
+          | BlockUploadedImageInfo
+          | BlockGenerationSourceImageInfo
+          | BlockPendingImageInfo;
+      };
+    }
+  | {
+      // Host→block ASYNC scan verdict for a pending `'display'` upload (the
+      // `asyncScan: true` early-resolve path). Sent AFTER an `IMAGE_UPLOAD_RESULT`
+      // carrying a {@link BlockPendingImageInfo}, once the host-side scan poll
+      // reaches a terminal outcome. Correlated to the originating
+      // `OPEN_IMAGE_UPLOAD` by `requestId` (the unguessable id the SDK generated)
+      // AND echoes `imageId` so the block can match it to the pending handle.
+      // The host emits it AT MOST ONCE per request; the SDK honors only the first.
+      //
+      // `result` is a discriminated {@link BlockImageScanResult}: `'scanned'`
+      // carries the moderated {@link BlockUploadedImageInfo} (the ONLY verdict a
+      // block may persist to a cross-user surface); `'blocked'` is terminal
+      // non-clean (no usable image); `'error'` is a transient/timeout, retryable.
+      //
+      // PARENT→block, so it is NOT a `BlockToParentMessage` and does NOT belong in
+      // the host `hostHandlerParity.ts` request INVENTORY.
+      type: 'IMAGE_SCAN_RESOLVED';
+      payload: { requestId: string; imageId: number; result: BlockImageScanResult };
+    }
+  | {
+      // Reply to SET_USER_CHECKPOINT. `ok: false` carries a UI-renderable
+      // `error` string (e.g. "wrong-ecosystem"), distinct from the block
+      // lifecycle error class.
+      type: 'USER_CHECKPOINT_SET';
+      payload: { requestId: string; ok?: boolean; error?: string };
+    }
+  | {
+      // Reply to APP_STORAGE_GET. `value` is `null` when the key isn't
+      // set OR when the viewer is anon. `error` is set on host-side
+      // failure; consumers always treat a non-empty `error` as the
+      // promise-reject signal.
+      type: 'APP_STORAGE_GET_RESULT';
+      payload: { requestId: string; value: unknown; error?: string };
+    }
+  | {
+      // Reply to APP_STORAGE_SET. A non-empty `error` is the
+      // reject signal, and any of three BYTE/ROW ceilings can raise
+      // it: the per-value cap (`APP_STORAGE_MAX_VALUE_BYTES`) or
+      // either per-(app, viewer) budget (`APP_STORAGE_MAX_BYTES`,
+      // `APP_STORAGE_MAX_ROWS`). They are not the only thing that
+      // can — the host's zod key cap does too, see below. Do not
+      // assume a rejection means the VALUE was too big; the row
+      // ceiling is the one a block usually reaches first, and it has
+      // nothing to do with the size of the value being written.
+      //
+      // 🔴 `error` IS A HOST-AUTHORED MESSAGE, NOT A CODE. The host's
+      // router throws a `TRPCError` carrying BOTH a
+      // `code: 'PAYLOAD_TOO_LARGE'` and a per-site `message`, and the
+      // bridge's `storageErrorMessage()` forwards **`err.message`** —
+      // never the code. So `"PAYLOAD_TOO_LARGE"` is a value this field
+      // CANNOT hold, and a block that branches on it takes the wrong
+      // branch every time. (`createMockHost` emitted exactly that
+      // string for three releases, which is how the mistake survived
+      // every local run; civitai/civitai-app-starters#343.)
+      //
+      // The CEILING strings are enumerated, measured and
+      // single-sourced in `blocks/appStorageErrors.ts` — the five
+      // `PAYLOAD_TOO_LARGE` sites plus the bridge's `'storage request
+      // failed'` fallback. Branch with `classifyAppStorageError(err)`
+      // from `@civitai/app-sdk/blocks` rather than spelling one here;
+      // it is the same module the mock and the starter harnesses draw
+      // their rejections from, so `dev:mock` now exercises the branch
+      // production takes.
+      //
+      // 🔴 THOSE SIX ARE NOT EVERY VALUE THIS FIELD CAN HOLD, AND
+      // NOTHING HERE LISTS THE REST. The bridge's catch arms are
+      // BLANKET, so every other rejection the host raises —
+      // authorization, approval, the feature-flag kill switch, plus
+      // tRPC's own zod input-validation messages, which never reach a
+      // handler at all — rides this same field. ALL of them classify
+      // `null`. That rule needs no enumeration and survives the host
+      // rewording a message; `invalid block token` (an expired token
+      // mid-session), `block instance revoked` and `Apps are not
+      // enabled` are ILLUSTRATIONS, not a bound. Two earlier drafts
+      // tried to list the set and both came up short — see the header
+      // of `appStorageErrors.ts` for why the third does not try.
+      //
+      // 🔴 ONE ZOD BOUND IS A CEILING NOTHING LOCAL ENFORCES: the
+      // host caps `key` at 200 characters
+      // (`z.string().min(1).max(200)` on the `.input()` schema), and
+      // neither `useAppStorage` nor `createMockHost` caps it. A key
+      // derived from a URL or a model name therefore saves under
+      // `dev:mock` and fails forever live, classified `null` — and a
+      // RELOAD does not fix it. See "Ceilings outside this set" in
+      // `appStorageErrors.ts`.
+      //
+      // 🔴 AND DO NOT RENDER IT. Server prose, not viewer copy: not
+      // localized, not written for an end user, free to move in any
+      // host deploy. Log it, classify it, show copy your app owns —
+      // and keep a generic arm for `null`. 🔴 Do NOT write "try
+      // again" in that arm: `null` is mostly expired or revoked
+      // tokens, and retrying an expired token never succeeds.
+      //
+      // `sizeBytes` is the byte size the row landed at, so the block
+      // can update its own quota estimate without another round-trip
+      // to `getQuota`.
+      type: 'APP_STORAGE_SET_RESULT';
+      payload: { requestId: string; ok?: boolean; error?: string; sizeBytes?: number };
+    }
+  | {
+      // Reply to APP_STORAGE_DELETE. `deleted: false` indicates the
+      // key wasn't present (still treated as success); explicit so
+      // callers can distinguish "I cleared it" from "it was already
+      // gone."
+      type: 'APP_STORAGE_DELETE_RESULT';
+      payload: { requestId: string; ok?: boolean; deleted?: boolean; error?: string };
+    }
+  | {
+      // Reply to APP_STORAGE_LIST. `keys` carries the key + a
+      // last-write timestamp (ISO string on the wire; the hook
+      // rehydrates to Date). `nextCursor` is omitted when the page is
+      // partial.
+      type: 'APP_STORAGE_LIST_RESULT';
+      payload: {
+        requestId: string;
+        keys: Array<{ key: string; updatedAt: string }>;
+        nextCursor?: string;
+        error?: string;
+      };
+    }
+  | {
+      type: 'APP_STORAGE_QUOTA_RESULT';
+      payload: {
+        requestId: string;
+        usedBytes: number;
+        rowCount: number;
+        limitBytes: number;
+        limitRows: number;
+        error?: string;
+      };
+    }
+  | {
+      // Reply to SHARED_LIST. `items` are newest-first; `createdAt`/`updatedAt`
+      // are ISO strings on the wire (the hook rehydrates to Date). `nextCursor`
+      // is omitted on the final page. `error` on host-side failure — consumers
+      // treat a non-empty `error` as the promise-reject signal (mirrors
+      // `APP_STORAGE_LIST_RESULT`).
+      type: 'SHARED_LIST_RESULT';
+      payload: {
+        requestId: string;
+        items: SharedStorageItemWire[];
+        nextCursor?: string;
+        error?: string;
+      };
+    }
+  | {
+      // Reply to SHARED_GET_COUNT. `count` is the entry's current vote total
+      // (0 when the key isn't present).
+      type: 'SHARED_GET_COUNT_RESULT';
+      payload: { requestId: string; count: number; error?: string };
+    }
+  | {
+      // Reply to SHARED_GET_COUNTS. `counts` maps each requested key to its
+      // vote total (absent keys resolve to 0).
+      type: 'SHARED_GET_COUNTS_RESULT';
+      payload: { requestId: string; counts: Record<string, number>; error?: string };
+    }
+  | {
+      // Reply to SHARED_APPEND. `key` is the id the host minted for the new
+      // entry. `error` on validation/host failure.
+      type: 'SHARED_APPEND_RESULT';
+      payload: { requestId: string; key: string; error?: string };
+    }
+  | {
+      // Reply to SHARED_VOTE. `count` is the entry's vote total AFTER applying
+      // the (idempotent) vote from this viewer.
+      type: 'SHARED_VOTE_RESULT';
+      payload: { requestId: string; count: number; error?: string };
+    }
+  | {
+      // Reply to SHARED_UNVOTE. `count` is the entry's vote total AFTER
+      // removing this viewer's vote (idempotent when they hadn't voted).
+      type: 'SHARED_UNVOTE_RESULT';
+      payload: { requestId: string; count: number; error?: string };
+    }
+  | {
+      // Reply to SHARED_WITHDRAW. `deleted: false` means the viewer's entry
+      // wasn't present (still treated as success — idempotent withdraw).
+      type: 'SHARED_WITHDRAW_RESULT';
+      payload: { requestId: string; ok?: boolean; deleted?: boolean; error?: string };
+    }
+  | {
+      // Reply to SHARED_UPDATE. `ok: true` when the author's entry was updated
+      // in place (key/votes/reports preserved). `error` on failure — `NOT_FOUND`
+      // (missing/hidden), `FORBIDDEN` (viewer isn't the author), or a
+      // belt/size/serialization rejection. Consumers treat a PRESENT `error`
+      // (or `ok: false`) as the promise-reject signal — presence, not
+      // truthiness, so an `error: ''` cannot read as success (mirrors
+      // `SHARED_WITHDRAW_RESULT`; see the union's header note).
+      type: 'SHARED_UPDATE_RESULT';
+      payload: { requestId: string; ok?: boolean; error?: string };
+    }
+  | {
+      // Reply to SHARED_GET (single-row fetch-by-key). On success `item` is the
+      // same wire shape as one `SHARED_LIST_RESULT` item (incl. `count` +
+      // `viewerVoted`), or `null` when the key is missing / hidden (so a `?g=`
+      // deep-link to a withdrawn or moderated row resolves cleanly to "not
+      // found" rather than leaking it). `error` on host-side failure — consumers
+      // treat a non-empty `error` as the promise-reject signal.
+      type: 'SHARED_GET_RESULT';
+      payload: { requestId: string; item: SharedStorageItemWire | null; error?: string };
+    }
+  | {
+      // Reply to SHARED_REPORT. `ok: true` when the report was filed for mod
+      // review. `error` on host-side failure — NOT_FOUND (missing key), a
+      // trust/scope rejection, or rate-limit. Consumers treat a PRESENT
+      // `error` (or `ok: false`) as the reject signal — presence, not
+      // truthiness, so an `error: ''` cannot read as success (mirrors
+      // `SHARED_WITHDRAW_RESULT`). Filing a report does NOT hide the row — a
+      // moderator decides.
+      type: 'SHARED_REPORT_RESULT';
+      payload: { requestId: string; ok?: boolean; error?: string };
+    }
+  | {
+      // Reply to SAVE_IMAGE (host-mediated download bridge). `ok: true` once the
+      // host has triggered the browser download in its unsandboxed top frame.
+      // `error` on host-side failure — a URL whose origin isn't on the civitai
+      // image/blob allowlist, an `imageId` the requesting viewer isn't allowed
+      // to see (gated read returned `hidden`/omitted), an over-size blob, or a
+      // fetch failure. Consumers treat a PRESENT `error` (or `ok: false`) as
+      // the reject signal — presence, not truthiness, so an `error: ''` cannot
+      // read as success (see the union's header note).
+      type: 'SAVE_IMAGE_RESULT';
+      payload: { requestId: string; ok?: boolean; error?: string };
+    }
+  | { type: 'SUSPEND'; payload?: undefined }
+  | { type: 'RESUME'; payload?: undefined };
+
+export type ParentToBlockMessageType = ParentToBlockMessage['type'];
+
+// ============================================================
+// Block → parent
+// ============================================================
+
+export type BlockToParentMessage =
+  // READINESS ANNOUNCE (the inverted handshake). Posted by the block's
+  // transport the instant its `message` listener is attached — i.e. the first
+  // moment a `BLOCK_INIT` could possibly be received — so the host can push the
+  // payload IN RESPONSE instead of blind-polling for it.
+  //
+  // 🔴 It is a HINT, never a precondition. It carries no data, expects no
+  // reply, and a host that never receives one (because the block runs an older
+  // SDK, because the post was dropped, or because the block simply never sends
+  // it) must still deliver `BLOCK_INIT` on its own bounded retry/timeout
+  // schedule. Conversely a host that does not understand `BLOCK_HELLO` ignores
+  // it — nothing about the handshake depends on it being handled.
+  //
+  // It is posted BEFORE any `BLOCK_INIT` has been validated, so at that moment
+  // the block has NOT yet authenticated its parent. That is precisely why the
+  // payload is empty: it discloses nothing a parent frame cannot already infer
+  // from the URL it framed.
+  | { type: 'BLOCK_HELLO'; payload?: undefined }
+  | { type: 'BLOCK_READY'; payload: { height: number } }
+  | { type: 'BLOCK_ERROR'; payload: { message: string; fatal: boolean } }
+  // The block's transport REFUSED an inbound host message at its trust boundary
+  // and dropped it. Fire-and-forget, no `requestId`, no reply: it reports a drop
+  // that has ALREADY happened, so there is nothing for the host to answer.
+  //
+  // 🔴 WHY THIS EXISTS — IT IS THE ONE BRIDGE SILENCE THE HOST CANNOT SEE.
+  // `@civitai/blocks-react`'s `transport/validate.ts` shape-checks every inbound
+  // payload and DROPS a failure with nothing but a `console.warn`. That check runs
+  // in the iframe, AFTER the host has already replied, so from the host's side the
+  // exchange completed: its own dispatcher counts it `handled`. The block's pending
+  // request then never settles and the UI hangs to its request timeout with no
+  // network call and no host-visible error. Measured cost: on 2026-09-18
+  // `custom-generators` served *"Couldn't load your kept images just now."* to
+  // every viewer from relist until a human found it by hand, while
+  // `civitai_app_block_renders_total` read `result=ok, error_class=none` for the
+  // whole window (that metric fires once per mount and is blind to anything after
+  // ready). This message is what makes that state a number instead of a warning in
+  // a console nobody has open.
+  //
+  // 🔴 `type` IS THE HANGING REQUEST'S TYPE, NOT THE REJECTED REPLY'S. Two reasons,
+  // and the first one is load-bearing:
+  //  - the host's bridge counter bounds its `type` label against the code-owned
+  //    block→host INVENTORY (`boundBridgeMessageType`), which holds NO `*_RESULT`
+  //    key — measured: 0 of its 46. Putting `IMAGES_RESULT` on this wire would
+  //    therefore clamp to `'other'` server-side and collapse every rejection in the
+  //    protocol onto ONE label, i.e. the count would exist and distinguish nothing;
+  //  - the request type is the operationally useful half anyway: it names what the
+  //    viewer is waiting on. The reply type and its top-level validator are both
+  //    derivable from it, and the block's own `console.warn` names them.
+  // Senders MUST clamp with {@link boundBlockToParentMessageType}; a rejection with
+  // no resolvable pending request (a host PUSH — `THEME_CHANGE`,
+  // `CONSENT_UNAVAILABLE`, `TOKEN_REFRESH`) carries
+  // {@link OTHER_MESSAGE_TYPE_LABEL} instead, because nothing awaits a push so
+  // there is no hanging request to name.
+  //
+  // A host that does not handle this type degrades safely: its dispatcher records
+  // one `no_handler` and, because the payload carries no `requestId`, sends no NACK.
+  | { type: 'BLOCK_MESSAGE_REJECTED'; payload: { type: string } }
+  | { type: 'REQUEST_TOKEN'; payload: { requestId: string; blockInstanceId: string } }
+  | { type: 'RESIZE_IFRAME'; payload: { height: number } }
+  // `idempotencyKey` (OPTIONAL): a stable client id the block reuses across its
+  // own retry of the SAME logical submit. The host forwards it to the server,
+  // which threads it to the orchestrator `externalId` dedupe so a lost-response /
+  // timeout retry collapses to the existing workflow instead of a SECOND Buzz
+  // charge. Absent → today's behavior (no dedupe). Additive/backward-compatible:
+  // an older host that ignores the field simply never dedupes.
+  //
+  // 🔴 ITS FORMAT IS NOT FREE. `string` here is the WIRE type, not the accepted
+  // set: the host rejects anything outside `^[A-Za-z0-9_-]{1,64}$` with a 400
+  // before the procedure runs, and a colon — the most natural delimiter for a
+  // composite key — is specifically excluded. Validate with
+  // `isValidBlockIdempotencyKey` from this same subpath; see `./idempotency.ts`
+  // for the provenance, the four host entry points and why the colon ban is a
+  // correctness invariant rather than a style rule.
+  | {
+      type: 'SUBMIT_WORKFLOW';
+      payload: { requestId: string; body: WorkflowBody; idempotencyKey?: string };
+    }
+  | { type: 'ESTIMATE_WORKFLOW'; payload: { requestId: string; body: WorkflowBody } }
+  // `waitSeconds` (OPTIONAL): ask the host to LONG-POLL this read — to hold the
+  // request open on the orchestrator (its `?wait=` parameter, in SECONDS, not
+  // milliseconds) until the workflow reaches a terminal status, instead of
+  // answering with whatever the status is right now. Absent → today's behavior
+  // (an immediate read). Additive/backward-compatible in BOTH directions: an
+  // older host that ignores the field answers immediately, and a block that
+  // never sends it is unaffected by a host that honors it.
+  //
+  // 🔴 THE CURRENT HOST HONOURS IT, AND CLAMPS IT (#388). Do not read the
+  // paragraph above as "the host ignores this" — it describes an OLDER host.
+  // Measured contract (flooring first, `<= 0` meaning no hold, and a
+  // `MAX_BLOCK_POLL_WAIT_SECONDS = 15` ceiling), with the host sha it was read
+  // at: `WatchWorkflowOptions.waitSeconds` in `@civitai/blocks-react`'s
+  // `useBuzzWorkflow.ts`. Stated in ONE place on purpose; a second copy is what
+  // went stale here in the first place.
+  //
+  // 🔴 ONLY SEND THIS FROM A LOOP THAT AWAITS EACH POLL BEFORE ISSUING THE NEXT.
+  // A fixed `setInterval` against a host holding 15s stacks ~7 concurrent
+  // requests per workflow — which is why this is a per-message hint rather than
+  // a server-side default: deployed blocks' loop shapes are unknown and cannot
+  // be assumed sequential. `useBuzzWorkflow().watch()` is sequential by
+  // construction and is the intended sender.
+  | {
+      type: 'POLL_WORKFLOW';
+      payload: { requestId: string; workflowId: string; waitSeconds?: number };
+    }
+  // Ask the host to cancel a running workflow on the orchestrator (real
+  // server-side stop, not just client-side untracking). The host re-derives
+  // ownership from the viewer's orchestrator token, so a block can only
+  // cancel workflows the viewer owns.
+  | { type: 'CANCEL_WORKFLOW'; payload: { requestId: string; workflowId: string } }
+  | { type: 'OPEN_BUZZ_PURCHASE'; payload: { requestId: string; suggestedAmount?: number } }
+  // Ask the host for the viewer's per-pool Buzz balance. Host-mediated + token-
+  // bound: the host reads it via the `blocks.getMyBuzzBalance` tRPC mutation
+  // (scoped to the block token's viewer) and replies with `BUZZ_BALANCE_RESULT`.
+  // The block never sees the balance API or credentials directly.
+  | { type: 'GET_BUZZ_BALANCE'; payload: { requestId: string } }
+  // Ask the host for the signed-in viewer (id/username/status + optional
+  // buzzBudget). Host-mediated + token-bound: the host resolves the viewer from
+  // the block token and reads via the `blocks.getMyViewer` tRPC mutation,
+  // replying with `VIEWER_RESULT`. An anonymous / banned token comes back as the
+  // reply's free-text `error`. The block never sees the viewer API directly.
+  | { type: 'GET_VIEWER'; payload: { requestId: string } }
+  // Ask the host for the viewer's Buzz-transaction ledger page. Host-mediated +
+  // token-bound (scope `buzz:read:self`): the host self-binds the account off
+  // the block token and reads via `blocks.getMyBuzzTransactions`, replying with
+  // `BUZZ_TRANSACTIONS_RESULT`. `params` are advisory filters — never trusted for
+  // auth. The block never sees the ledger API or credentials directly.
+  | {
+      type: 'GET_BUZZ_TRANSACTIONS';
+      payload: { requestId: string; params?: BlockBuzzTransactionsParams };
+    }
+  // Ask the host for the viewer's all-pool Buzz balances (scope `buzz:read:self`).
+  // Host reads via `blocks.getMyBuzzAccounts` → `BUZZ_ACCOUNTS_RESULT`.
+  | { type: 'GET_BUZZ_ACCOUNTS'; payload: { requestId: string } }
+  // Ask the host for the viewer's per-modelVersion generation compensation for
+  // the month of `params.date` (scope `buzz:read:self`). Host reads via
+  // `blocks.getMyDailyCompensation` → `DAILY_COMPENSATION_RESULT`.
+  | {
+      type: 'GET_DAILY_COMPENSATION';
+      payload: { requestId: string; params?: BlockDailyCompensationParams };
+    }
+  // Ask the host to import a wildcard pack's parsed prompt lists by model version.
+  // TOKEN-INDEPENDENT (no block scope): the host resolves + fetches + unzips +
+  // parses it in the USER'S authenticated page session (every real download gate
+  // enforced) and replies with `WILDCARD_PACK_RESULT` (a `pack` or a discriminated
+  // `error` code). The untrusted iframe never sees the session, signed URL, or raw
+  // bytes.
+  | { type: 'GET_WILDCARD_PACK'; payload: { requestId: string; modelVersionId: number } }
+  // Ask the host for a page of the calling app's OWN generator subqueue — the
+  // tag-scoped list of generations this app produced for the viewer, newest-first
+  // (scope `ai:write:budgeted`, same trust boundary as submit). Host-mediated +
+  // token-bound: the host self-binds the account off the block token and forces
+  // the per-app tag filter (the params carry NO `tags` — a block can't widen it),
+  // reading via `blocks.queryAppWorkflows`, and replies with `APP_WORKFLOWS_RESULT`.
+  // `params` (cursor/limit) are advisory — never trusted for auth.
+  | {
+      type: 'QUERY_APP_WORKFLOWS';
+      payload: { requestId: string; params?: AppWorkflowsParams };
+    }
+  | {
+      // Ask the host to PUBLISH selected outputs of ONE of the calling app's OWN
+      // workflows (from its app subqueue) as bare, REAL-SCANNED public Image rows.
+      // The block sends `workflowId` + optional `imageIndexes` (indexes into the
+      // workflow's `images` as seen via QUERY_APP_WORKFLOWS) — NEVER urls: the
+      // HOST resolves the orchestrator urls server-side from the ownership-
+      // verified workflow, so the iframe can't inject an arbitrary blob. FAIL-
+      // CLOSED server-side: the host re-derives (viewer, app, workflowId)
+      // ownership before reading the workflow, re-uploads each selected output to
+      // civitai storage, and runs the FULL image-scan pipeline (no skip). No Post,
+      // no gallery attach, no rewards/notifications. Host reads via
+      // `blocks.publishGenerationOutputs` → `PUBLISH_RESULT`. Host-chrome shows a
+      // consent confirm before publishing. `imageIndexes` absent ⇒ all available
+      // outputs. `title` is an optional advisory label (host MAY ignore it).
+      type: 'PUBLISH_GENERATION_OUTPUTS';
+      payload: { requestId: string; workflowId: string; imageIndexes?: number[]; title?: string };
+    }
+  | {
+      // Ask the host to create a REAL, PUBLISHED Post on the VIEWER'S profile
+      // from the calling app's OWN outputs. The strictly-more-consequential
+      // SIBLING of PUBLISH_GENERATION_OUTPUTS: that one makes a bare Image row
+      // with no post, no feed presence, no reward and no notification; this one
+      // makes public, feed-visible, reward-earning content under the viewer's
+      // byline. Scope `posts:write:self` (NOT `ai:write:budgeted`), which is
+      // SENSITIVE and CONSENT-GATED. Host reads via `blocks.createPostFromApp`
+      // → `CREATE_POST_RESULT`.
+      //
+      // 🔴 NO ARM OF `sources` ACCEPTS A URL, AND THAT IS THE SECURITY SHAPE. A
+      // `workflow` source carries INDEXES into the host's own ordered
+      // projection of an ownership-verified workflow; a `published` source
+      // carries `Image` ids the server re-verifies for owner + this app's
+      // provenance marker + `postId IS NULL`. So a sandboxed iframe can never
+      // name the bytes that get published — only choose among bytes the server
+      // already attributed to it. Two kinds rather than one because an app that
+      // publishes to its grid first and lets the viewer post the one they like
+      // cannot be built on fresh outputs alone.
+      //
+      // 🔴 THE HOST NEVER RENDERS THESE STRINGS AS THE CONSENT SCREEN. Before
+      // asking the viewer it resolves the request server-side and shows THAT —
+      // the tag names that will ACTUALLY be applied (unmatched names are
+      // dropped, never minted), host-fetched model/version names for a gallery
+      // attach, and real thumbnails. `title`/`detail` are bounded and screened
+      // server-side and a `detail` containing a link is refused.
+      //
+      // Consent-gated ⇒ `'human'` timeout bucket: the reply waits on a click or
+      // a dismiss, so it must NOT inherit the ~30s protocol default.
+      type: 'CREATE_POST_FROM_APP';
+      payload: {
+        requestId: string;
+        /** Image sources, in POST ORDER. At least one; the host caps the total. */
+        sources: BlockPostSource[];
+        title?: string;
+        detail?: string;
+        /** Requested tag NAMES. Resolved against EXISTING tags only. */
+        tags?: string[];
+        /** Optional model-version gallery attach. Gated hard server-side. */
+        modelVersionId?: number;
+      };
+    }
+  | {
+      // Ask the PAGE host to prepare a training dataset from the VIEWER'S OWN
+      // images — step 1 of the App Blocks `kind: 'training'` flow. The host calls
+      // `blocks.prepareTrainingDataset` with the page's block token (the block's
+      // own origin cannot reach it) and replies `TRAINING_DATASET_RESULT`. No
+      // dialog: preparing charges nothing.
+      //
+      // Scope `ai:write:budgeted`; flag `app-blocks-training-kind`; page host
+      // only (the model slot NACKs it with a `TRAINING_DATASET_RESULT` error).
+      // `items` is shape-checked by the host against the server's own item
+      // schema before any call — see `BlockTrainingDatasetItem` for the bounds.
+      //
+      // A server round-trip that imports up to 50 images into the orchestrator
+      // (the server's own import budget is 60s), so it is bucketed `'protocol'`
+      // but sent under the workflow trio's longer bound — see
+      // `@civitai/blocks-react`'s `requestTimeouts.ts`.
+      type: 'PREPARE_TRAINING_DATASET';
+      payload: { requestId: string; items: BlockTrainingDatasetItem[] };
+    }
+  | {
+      // Ask the PAGE host to RUN a quoted `kind: 'training'` body. The host
+      // reads the quote back from the server (`blocks.previewTrainingQuote`),
+      // shows the viewer a consent dialog in ITS chrome — every number on it
+      // server-resolved, never from this body — records the confirmation
+      // (`blocks.consentTrainingQuote`, session-only) and only then submits.
+      // Replies `TRAINING_RESULT`.
+      //
+      // 🔴 THIS IS THE ONLY WAY A TRAINING RUN STARTS. The server refuses a
+      // training submit whose quote no signed-in session confirmed, so the same
+      // body sent as SUBMIT_WORKFLOW is refused.
+      //
+      // Consent-gated ⇒ `'human'` timeout bucket.
+      type: 'RUN_TRAINING';
+      payload: { requestId: string; body: WorkflowBodyTraining };
+    }
+  | {
+      // Ask the host for per-VIEWER gated display data for a set of image ids
+      // (the ids a benchmark grid stored via shared storage). The host applies
+      // the REQUESTING VIEWER's browsing-level clamp server-side and returns a
+      // `BlockGatedImage` per resolvable id: `visible` (moderated projection incl.
+      // url) or `hidden` (NO url — above ceiling / unscanned / flagged). The block
+      // can NEVER obtain an unclamped url for an image the viewer isn't allowed to
+      // see. Host reads via `blocks.getImagesByIds` → `IMAGES_RESULT`.
+      type: 'GET_IMAGES_BY_IDS';
+      payload: { requestId: string; imageIds: number[] };
+    }
+  // Ask the host to cancel ONE workflow in the calling app's OWN subqueue. FAIL-
+  // CLOSED server-side: the host re-derives (viewer, app, workflowId) ownership +
+  // asserts the per-app tag before the orchestrator cancel, so a block can only
+  // cancel a workflow it actually submitted for this viewer. Host reads via
+  // `blocks.cancelAppWorkflow` → `CANCEL_APP_WORKFLOW_RESULT` (the terminal
+  // projection, or a free-text `error`).
+  | { type: 'CANCEL_APP_WORKFLOW'; payload: { requestId: string; workflowId: string } }
+  | {
+      // Ask the host to open the platform's Checkpoint picker.
+      //
+      // `baseModelGroup` is an OPTIONAL ecosystem-family FILTER (e.g. 'Flux1',
+      // 'SDXL'; a baseModel name like 'Flux.1 D' works too — the host collapses
+      // either to the family). OMIT it for an unconstrained pick across every
+      // family; pass it only to pin the pick to a family the block must stay in.
+      //
+      // The host has always treated this as optional — its
+      // `resolveCheckpointPickerRequest` accepts a bare `requestId`, and an
+      // absent group produces the bare `type = Checkpoint` clause, i.e. ALL
+      // generation-covered checkpoints rather than none. It was declared
+      // required here only on the SDK side, which left a block unable to offer
+      // any ecosystem but the one it started in.
+      //
+      // 🔴 OMIT the key; never send an empty string. The host's
+      // `getBaseModelGroup('')` returns the real ecosystem key 'Other', and the
+      // model-slot host does not strip it — so `''` NARROWS the picker to the
+      // Other family instead of widening it.
+      type: 'OPEN_CHECKPOINT_PICKER';
+      payload: {
+        requestId: string;
+        /** Optional ecosystem-family filter. Absent ⇒ unconstrained. Never ''. */
+        baseModelGroup?: string;
+        /** Currently-selected versionId so the picker can pre-highlight it. */
+        currentVersionId?: number;
+      };
+    }
+  | {
+      // Ask the host (PAGE surface) to open its native resource picker filtered
+      // to a single type. Generalizes OPEN_CHECKPOINT_PICKER from Checkpoint-only
+      // to a typed allowlist (v1: 'Checkpoint' | 'LORA'); the host REJECTS any
+      // other `resourceType` (the modal never opens, the hook resolves to null
+      // via the SDK timeout — callers should restrict to the allowed types).
+      // `baseModelGroup` is an optional family hint (ecosystem key like 'Flux1'
+      // or a baseModel name) so a LoRA pick can be constrained to the page's
+      // checkpoint family. The host returns ONLY the chosen `BlockResourceInfo`.
+      type: 'OPEN_RESOURCE_PICKER';
+      payload: {
+        requestId: string;
+        resourceType: BlockResourcePickerType;
+        /** Optional base-model family hint (ecosystem key or baseModel name). */
+        baseModelGroup?: string;
+      };
+    }
+  | {
+      // Ask the host to open its native image-upload modal (host-chrome — the
+      // iframe never handles the bytes). The app decides what the image is for
+      // (avatar / cover / background / reference / img2img source / …).
+      //
+      // `purpose` selects the upload MODE (absent ⇒ `'display'`, so an older SDK
+      // stays byte-compatible — the host normalizes an unknown value to the safe
+      // moderated default):
+      //   • `'display'` — a PUBLIC image; routes through civitai's session-authed
+      //     scan pipeline (SFW + no-flag gate). The host returns a MODERATED
+      //     {@link BlockUploadedImageInfo} on `IMAGE_UPLOAD_RESULT`.
+      //   • `'generationSource'` — a PRIVATE img2img source; UNSCANNED (the
+      //     orchestrator scans at gen time). The host returns ONLY the source
+      //     shape ({@link BlockGenerationSourceImageInfo} — { url, width, height }).
+      // Generalizes cleanly the same way OPEN_RESOURCE_PICKER did the picker.
+      //
+      // `asyncScan` OPTS IN to the NON-BLOCKING display flow (absent/false ⇒
+      // BLOCKING, byte-compatible with an older SDK/host):
+      //   • absent / `false` — the host blocks on the scan and returns a MODERATED
+      //     {@link BlockUploadedImageInfo} on `IMAGE_UPLOAD_RESULT` (as before).
+      //   • `true` (display only) — the host EARLY-RESOLVES on persist with a
+      //     {@link BlockPendingImageInfo} (`status:'pending'`), then streams the
+      //     scan verdict on `IMAGE_SCAN_RESOLVED`. IGNORED for `'generationSource'`
+      //     (that path has no host-side scan). An older host that predates the flag
+      //     ignores it and blocking-resolves a moderated image — the SDK hook
+      //     tolerates that (treats it as immediately-scanned; see the compat matrix
+      //     in `useImageUpload`).
+      type: 'OPEN_IMAGE_UPLOAD';
+      payload: { requestId: string; purpose?: BlockUploadPurpose; asyncScan?: boolean };
+    }
+  | {
+      // Persist a viewer's checkpoint override via the host. `null` clears
+      // the override and falls back to the publisher default.
+      type: 'SET_USER_CHECKPOINT';
+      payload: { requestId: string; versionId: number | null };
+    }
+  | {
+      // Ask the host to navigate. `scope` selects the SPACE and `path` is a path
+      // within it; see {@link BlockNavigateScope}.
+      //
+      // 🔴 `scope` IS OPTIONAL AND ABSENT MEANS `'app'` — a block built against an
+      // SDK that predates the field keeps exactly the behaviour it had, for `'/x'`
+      // and `'x'` alike, because the host normalises leading slashes away in both
+      // scopes. So this field is additive on the wire in both directions: an older
+      // host ignores it (and was app-scoped anyway), and a newer host defaults it.
+      //
+      // `target` is a REQUEST. The host owns the outcome — how it acts on
+      // `'new_tab'` is host behaviour and the host is the authority on it; this
+      // package states only what it sends.
+      //
+      // Fire-and-forget: there is no `requestId` and no reply, so a host that
+      // REFUSES the request (site scope on a surface without the capability, a
+      // scheme, `/api/*` in site scope) simply drops the message and the block
+      // never learns. Do not build a flow that needs to know.
+      type: 'NAVIGATE';
+      payload: { path: string; scope?: BlockNavigateScope; target: 'current' | 'new_tab' };
+    }
+  // Anonymous conversion. A block rendered for a logged-out viewer
+  // (`BLOCK_INIT.viewer === null`) asks the host to start the platform's
+  // login flow when the user clicks an action that needs auth/money (e.g.
+  // Generate). The host validates this like every other inbound message
+  // (origin + `event.source` pinned, only honored after BLOCK_READY) and
+  // opens its login UI. `returnUrl` is an optional same-origin in-app path
+  // to return to after sign-in; the host sanitises it (rejecting absolute /
+  // protocol-relative values) and defaults to the current page when omitted.
+  // Fire-and-forget — there is no host→block reply (the page reloads /
+  // re-inits the block as an authenticated viewer once login completes).
+  | {
+      type: 'REQUEST_SIGN_IN';
+      payload?: { returnUrl?: string };
+    }
+  // Lazy consent. A block rendered for a LOGGED-IN viewer whose block token is
+  // missing a consent-gated scope (e.g. `ai:write:budgeted` / `buzz:read:self`
+  // were withheld at mint because the viewer hasn't granted them yet) asks the
+  // host to open its consent UI when the user clicks an action that needs that
+  // capability (e.g. Generate) — instead of prompting on load. The host already
+  // knows which scopes are missing (from the mint response), so `scopes` is an
+  // optional advisory hint; the host grants the missing set it computed and
+  // re-mints the token. The host validates this like every inbound message
+  // (origin + `event.source` pinned, only honored after BLOCK_READY).
+  //
+  // Fire-and-forget — there is no host→block reply. On grant the host re-mints
+  // and pushes a TOKEN_REFRESH carrying the now-granted scopes; the block sees
+  // the new scope on its token and retries the action. Mirrors REQUEST_SIGN_IN.
+  | {
+      type: 'REQUEST_CONSENT';
+      payload?: { scopes?: string[] };
+    }
+  | {
+      type: 'TRACK_EVENT';
+      payload: { eventName: string; properties?: Record<string, unknown> };
+    }
+  // Civitai Apps KV datastore (W4-v0). Storage calls go through the host —
+  // the block never sees the apps DB credentials. Keys are NAMESPACED per
+  // (block instance, user); the byte and row BUDGETS are enforced per (app,
+  // user), so every instance of one app shares one budget per viewer.
+  // `value` is freeform JSON. Ceilings: `APP_STORAGE_MAX_VALUE_BYTES` per
+  // value, `APP_STORAGE_MAX_BYTES` + `APP_STORAGE_MAX_ROWS` per (app, viewer)
+  // — see `./appStorageLimits.ts`, which is the only place they are written
+  // down and carries their provenance.
+  | {
+      type: 'APP_STORAGE_GET';
+      payload: { requestId: string; key: string };
+    }
+  | {
+      type: 'APP_STORAGE_SET';
+      payload: { requestId: string; key: string; value: unknown };
+    }
+  | {
+      type: 'APP_STORAGE_DELETE';
+      payload: { requestId: string; key: string };
+    }
+  | {
+      type: 'APP_STORAGE_LIST';
+      payload: { requestId: string; prefix?: string; limit?: number; cursor?: string };
+    }
+  | {
+      type: 'APP_STORAGE_QUOTA';
+      payload: { requestId: string };
+    }
+  // Civitai Apps SHARED datastore (W?-Phase 2). Unlike APP_STORAGE (per block
+  // instance + viewer, arbitrary JSON), the SHARED store is APP-scoped, append-
+  // only, and community-votable: any viewer appends a `{ title, body? }` entry
+  // and any viewer votes it up/down. Calls go through the host — the block never
+  // sees the datastore credentials, and the host injects the viewer identity +
+  // block token (the block sends NO token).
+  | {
+      type: 'SHARED_LIST';
+      payload: { requestId: string; prefix?: string; limit?: number; cursor?: string };
+    }
+  | {
+      type: 'SHARED_GET_COUNT';
+      payload: { requestId: string; key: string };
+    }
+  | {
+      type: 'SHARED_GET_COUNTS';
+      payload: { requestId: string; keys: string[] };
+    }
+  | {
+      type: 'SHARED_APPEND';
+      payload: { requestId: string; value: SharedStorageValue };
+    }
+  | {
+      type: 'SHARED_VOTE';
+      payload: { requestId: string; key: string };
+    }
+  | {
+      type: 'SHARED_UNVOTE';
+      payload: { requestId: string; key: string };
+    }
+  | {
+      type: 'SHARED_WITHDRAW';
+      payload: { requestId: string; key: string };
+    }
+  // Author-scoped in-place update of a SHARED entry the viewer contributed.
+  // The host re-derives ownership from the injected viewer identity (the block
+  // sends NO token) and rejects a non-author with FORBIDDEN / a missing (or
+  // hidden) key with NOT_FOUND. `title`/`body` go through the same content
+  // belt as SHARED_APPEND; `data` is opaque. The `key` and vote/report totals
+  // are preserved — only the contributed `value` changes.
+  | {
+      type: 'SHARED_UPDATE';
+      payload: { requestId: string; key: string; value: SharedStorageValue };
+    }
+  // Fetch ONE shared entry by key — the single-row companion to SHARED_LIST's
+  // paged read, so a `?g=<key>` deep-link to an item past the first page
+  // resolves. Host reads via `apps.shared.get`, replying with
+  // `SHARED_GET_RESULT` (the full item incl. `count`/`viewerVoted`, or `null`
+  // for a missing/hidden row). Respects the SAME per-viewer visibility gate as
+  // `list` — a hidden/withdrawn row is never leaked. The block sends NO token.
+  | {
+      type: 'SHARED_GET';
+      payload: { requestId: string; key: string };
+    }
+  // Report a posted shared entry for moderator review (post-write abuse
+  // reporting on a shared board). Host reads via `apps.shared.report`, replying
+  // with `SHARED_REPORT_RESULT`. Trust-gated + rate-limited server-side (same
+  // write-scope trust boundary as SHARED_APPEND). `reason` is optional free
+  // text (bounded server-side). The block sends NO token.
+  | {
+      type: 'SHARED_REPORT';
+      payload: { requestId: string; key: string; reason?: string };
+    }
+  // Ask the host to DOWNLOAD an image the block already displays — the host
+  // fetches the blob in its UNSANDBOXED top frame and triggers the browser
+  // "Save As" (a sandboxed opaque-origin block lacks `allow-downloads`, so it
+  // can only copy a URL). Host reads/validates + downloads, replying with
+  // `SAVE_IMAGE_RESULT`. TWO complementary variants (send exactly one of `url`
+  // / `imageId`):
+  //   • `url` — the block's OWN fresh generation output (an orchestration blob
+  //     it has no `imageId` for yet). The host ALLOWLISTS the URL's origin to
+  //     the civitai image/blob CDN and REFUSES an arbitrary host (an unverified
+  //     block's `url`/`data` is untrusted — never a host-side fetch of an
+  //     attacker origin).
+  //   • `imageId` — a cross-user grid image (e.g. a benchmark cell). The host
+  //     resolves it through the SAME per-viewer gated read that backs
+  //     `GET_IMAGES_BY_IDS`, so a withheld/above-ceiling image can NEVER be
+  //     coerced into a download.
+  // `filename` is an optional download name (the host sanitizes it — no path
+  // traversal / duplicate-extension). The block sends NO token.
+  | {
+      type: 'SAVE_IMAGE';
+      payload: {
+        requestId: string;
+        /** Own-output URL — origin-allowlisted host-side. Mutually exclusive with `imageId`. */
+        url?: string;
+        /** Cross-user image id — routed through the gated per-viewer read. Mutually exclusive with `url`. */
+        imageId?: number;
+        /** Optional download filename (host-sanitized). */
+        filename?: string;
+      };
+    }
+  | {
+      // Ask the host to FOLLOW / UNFOLLOW a collection for the viewer, replying
+      // with `COLLECTION_FOLLOW_RESULT`. TOKEN-INDEPENDENT — the block sends NO
+      // token and needs NO block scope: the host calls the SESSION-authed
+      // `collection.follow` / `collection.unfollow` tRPC procedures, whose
+      // handlers pass `ctx.user.id` as BOTH actor and target. There is no field
+      // for a user id on this wire and the host's resolver would drop one.
+      //
+      // 🔴 THE CONSENT BOUNDARY IS A HOST-CHROME CONFIRM, AND IT IS THE ONLY
+      // CONSENT THIS PATH HAS. The HTTP predecessor
+      // (`POST /api/v1/blocks/collections/[id]/follow`, scope
+      // `collections:write:self`) prompted NOBODY — that scope is consent-exempt
+      // server-side — so this bridge TIGHTENS a zero-prompt path into one prompt
+      // per action. What it gives up is the manifest `scopes` declaration, i.e.
+      // the ex-ante signal a moderator reads before install. The trade is
+      // "reviewable before install" → "consented at the moment of action".
+      //
+      // 🔴 THE HOST NAMES THE COLLECTION IN THAT CONFIRM, AND IT RESOLVES THE
+      // NAME ITSELF from this `collectionId`. There is deliberately no `name`
+      // field here: a block-supplied one would let a card reading "Follow ⭐ Cute
+      // Cats" post a different id with the host's own chrome vouching for it.
+      //
+      // 🔴 THE REPLY WAITS ON A PERSON — bucketed `'human'` in
+      // `@civitai/blocks-react`'s `requestTimeouts.ts`, so it carries the
+      // 10-minute consent bound, never the ~30s protocol default.
+      //
+      // The host resolves that identity with ONE authenticated read per DISTINCT
+      // id and bounds it at 20 per block instance; past the cap it refuses with
+      // `collection-unavailable`, the SAME code a not-visible collection gets.
+      type: 'SET_COLLECTION_FOLLOW';
+      payload: {
+        requestId: string;
+        /** Positive integer. A numeric STRING is refused, never coerced. */
+        collectionId: number;
+        /** `true` ⇒ follow, `false` ⇒ unfollow. */
+        follow: boolean;
+      };
+    };
+
+export type BlockToParentMessageType = BlockToParentMessage['type'];
+
+/**
+ * Every {@link BlockToParentMessage} type as a RUNTIME value, in union order.
+ *
+ * 🔴 WHY A RUNTIME ARRAY EXISTS WHEN THE UNION ALREADY DOES. A union is a TYPE:
+ * it evaporates at build time, so nothing at runtime can answer *"is this string
+ * one the protocol declares?"*. `BLOCK_MESSAGE_REJECTED` needs exactly that
+ * answer before it puts a `type` on the wire, for two reasons that are both
+ * silent when they fail:
+ *  - the value reaches a Prometheus LABEL. prom-client retains every distinct
+ *    label set in the Node heap forever across the host fleet, so an unbounded
+ *    label is a memory-exhaustion vector, not untidiness;
+ *  - the host's beacon schema caps `type` at 128 chars and rejects the WHOLE
+ *    batch above it, so one over-length value destroys every legitimate count
+ *    flushed alongside it.
+ *
+ * 🔴 AND WHY IT IS GATED RATHER THAN HAND-MAINTAINED. A copied list answers the
+ * question while drifting from the union it claims to mirror, and the drift is
+ * invisible: a new message type simply reports as `'other'`. TWO gates hold it, and
+ * two is deliberate — an earlier revision had four over this one fact and needed a
+ * warning label about which of them a red build implicated. The `Exclude` gate below
+ * makes drift a BUILD ERROR in BOTH directions (a union member missing from the
+ * array, and an array entry the union does not declare), and
+ * `blockToParentMessageTypes.test.ts` re-derives the union from this file's own
+ * source text under plain `vitest run`. ⚠️ THEY ARE NOT INDEPENDENT: the `Exclude`
+ * gate catches BOTH directions — a union member missing from the array and an array
+ * entry the union does not declare — so it already covers the array being edited
+ * alone, earlier, and for consumers. (An earlier revision of this sentence claimed
+ * that case as the runtime test's unique property; it is not.) What the runtime
+ * test uniquely buys is the TOOL: it is the only one that fails under plain
+ * `vitest run`, so "what test fails when someone adds a message type" has an
+ * answer that is not "a typecheck".
+ *
+ * ⚠️ Measured 2026-09-19: this set MINUS
+ * `BLOCK_MESSAGE_REJECTED` — the member this change adds, so 46 of the 47 below —
+ * was exactly equal to the 46 keys of civitai's own `hostHandlerParity.ts`
+ * `INVENTORY`, which
+ * is what `boundBridgeMessageType` bounds the host-side `type` label against. That
+ * equality is what makes a value clamped here survive the host's clamp unchanged —
+ * it is a measurement, not an invariant, and civitai's own compile-time gate
+ * (published SDK union ⊆ `keyof INVENTORY`) is what holds one direction of it.
+ */
+export const BLOCK_TO_PARENT_MESSAGE_TYPES = [
+  'BLOCK_HELLO',
+  'BLOCK_READY',
+  'BLOCK_ERROR',
+  'BLOCK_MESSAGE_REJECTED',
+  'REQUEST_TOKEN',
+  'RESIZE_IFRAME',
+  'SUBMIT_WORKFLOW',
+  'ESTIMATE_WORKFLOW',
+  'POLL_WORKFLOW',
+  'CANCEL_WORKFLOW',
+  'OPEN_BUZZ_PURCHASE',
+  'GET_BUZZ_BALANCE',
+  'GET_VIEWER',
+  'GET_BUZZ_TRANSACTIONS',
+  'GET_BUZZ_ACCOUNTS',
+  'GET_DAILY_COMPENSATION',
+  'GET_WILDCARD_PACK',
+  'QUERY_APP_WORKFLOWS',
+  'PUBLISH_GENERATION_OUTPUTS',
+  'CREATE_POST_FROM_APP',
+  'PREPARE_TRAINING_DATASET',
+  'RUN_TRAINING',
+  'GET_IMAGES_BY_IDS',
+  'CANCEL_APP_WORKFLOW',
+  'OPEN_CHECKPOINT_PICKER',
+  'OPEN_RESOURCE_PICKER',
+  'OPEN_IMAGE_UPLOAD',
+  'SET_USER_CHECKPOINT',
+  'NAVIGATE',
+  'REQUEST_SIGN_IN',
+  'REQUEST_CONSENT',
+  'TRACK_EVENT',
+  'APP_STORAGE_GET',
+  'APP_STORAGE_SET',
+  'APP_STORAGE_DELETE',
+  'APP_STORAGE_LIST',
+  'APP_STORAGE_QUOTA',
+  'SHARED_LIST',
+  'SHARED_GET_COUNT',
+  'SHARED_GET_COUNTS',
+  'SHARED_APPEND',
+  'SHARED_VOTE',
+  'SHARED_UNVOTE',
+  'SHARED_WITHDRAW',
+  'SHARED_UPDATE',
+  'SHARED_GET',
+  'SHARED_REPORT',
+  'SAVE_IMAGE',
+  'SET_COLLECTION_FOLLOW',
+] as const;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BIDIRECTIONAL compile-time gate on the array above. Both directions matter and
+// they fail differently:
+//   - a union member MISSING from the array  ⇒ that type silently reports as
+//     `'other'`, so the counter exists and says nothing about the new message;
+//   - an array entry the union does NOT declare ⇒ a dead label value that reads
+//     as coverage for a message the protocol cannot send.
+// If either fires, the error prints the offending member(s):
+//   Type 'true' is not assignable to type '["…", "GET_SOMETHING_NEW"]'
+// ─────────────────────────────────────────────────────────────────────────────
+type _MessageTypesMissing = Exclude<
+  BlockToParentMessageType,
+  (typeof BLOCK_TO_PARENT_MESSAGE_TYPES)[number]
+>;
+type _MessageTypesExtra = Exclude<
+  (typeof BLOCK_TO_PARENT_MESSAGE_TYPES)[number],
+  BlockToParentMessageType
+>;
+type _MessageTypesGate = [_MessageTypesMissing] extends [never]
+  ? [_MessageTypesExtra] extends [never]
+    ? true
+    : ['BLOCK_TO_PARENT_MESSAGE_TYPES declares types the union does not:', _MessageTypesExtra]
+  : ['BLOCK_TO_PARENT_MESSAGE_TYPES is missing union member(s):', _MessageTypesMissing];
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+const _messageTypesGate: _MessageTypesGate = true;
+
+/**
+ * The bucket a message type falls into when the protocol does not declare it.
+ *
+ * 🔴 SPELLED `'other'` TO MATCH civitai's `boundBridgeMessageType` EXACTLY. Both
+ * sides clamp, and the host clamps LAST — so a different spelling here would be
+ * rewritten server-side, and the value this SDK reports would differ from the
+ * value that lands in the series. Same word ⇒ the emitted label IS the stored
+ * label, and a reader of one can reason about the other.
+ *
+ * It cannot collide with a real message type: every member of
+ * {@link BLOCK_TO_PARENT_MESSAGE_TYPES} is SCREAMING_SNAKE_CASE. Pinned by test
+ * rather than left to the eye.
+ */
+export const OTHER_MESSAGE_TYPE_LABEL = 'other';
+
+const BLOCK_TO_PARENT_MESSAGE_TYPE_SET: ReadonlySet<string> = new Set(
+  BLOCK_TO_PARENT_MESSAGE_TYPES,
+);
+
+/**
+ * Clamp an arbitrary string to a bounded block→host message label: the type
+ * itself when {@link BLOCK_TO_PARENT_MESSAGE_TYPES} declares it, else
+ * {@link OTHER_MESSAGE_TYPE_LABEL}.
+ *
+ * A `Set` rather than an object map ON PURPOSE: a plain-object lookup answers
+ * truthily for inherited keys (`'toString'`, `'constructor'`), so an object-backed
+ * membership test would pass ~12 prototype names through as "declared types" and
+ * put them on a prom label. A `Set` has no such keys.
+ *
+ * Takes `string` rather than the union so a JavaScript caller — and a block built
+ * against a NEWER protocol than the host it is running under — reaches the clamp
+ * rather than bypassing it on the strength of a type it does not actually satisfy.
+ */
+export function boundBlockToParentMessageType(type: string): string {
+  return BLOCK_TO_PARENT_MESSAGE_TYPE_SET.has(type) ? type : OTHER_MESSAGE_TYPE_LABEL;
+}
+
+/**
+ * Narrowing helper for either-direction message handlers.
+ *
+ * **Discriminator-only.** This only checks `data.type`; it does NOT validate
+ * the `payload` shape. A peer sending `{ type: 'BLOCK_INIT' }` with no
+ * payload or a malformed payload will satisfy this guard, and downstream
+ * access to fields like `data.payload.token.raw` will throw at runtime.
+ * Transports that cross a trust boundary (e.g. iframe `postMessage`) MUST
+ * runtime-validate the payload at the boundary before passing it on.
+ *
+ * Example:
+ *   if (isMessage(event.data, 'BLOCK_INIT')) {
+ *     // narrowed to BlockInitPayload — still must be validated
+ *   }
+ */
+export function isMessage<T extends ParentToBlockMessage | BlockToParentMessage, K extends T['type']>(
+  data: unknown,
+  type: K,
+): data is Extract<T, { type: K }> {
+  return (
+    typeof data === 'object' &&
+    data !== null &&
+    'type' in data &&
+    (data as { type: unknown }).type === type
+  );
+}
