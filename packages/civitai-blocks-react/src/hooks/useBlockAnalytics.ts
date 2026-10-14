@@ -1,0 +1,24 @@
+import { useCallback } from 'react';
+
+import { getTransport } from '../transport/singleton.js';
+
+/** What {@link useBlockAnalytics} returns. */
+export interface UseBlockAnalytics {
+  track: (eventName: string, properties?: Record<string, unknown>) => void;
+}
+
+/**
+ * Fire-and-forget analytics tracking. The host forwards events to its
+ * analytics pipeline (ClickHouse in production); the block doesn't see
+ * acknowledgements and shouldn't block on them.
+ *
+ * @example
+ * const { track } = useBlockAnalytics();
+ * track('generate_clicked', { modelId });
+ */
+export function useBlockAnalytics(): UseBlockAnalytics {
+  const track = useCallback((eventName: string, properties?: Record<string, unknown>) => {
+    getTransport().sendMessage({ type: 'TRACK_EVENT', payload: { eventName, properties } });
+  }, []);
+  return { track };
+}
