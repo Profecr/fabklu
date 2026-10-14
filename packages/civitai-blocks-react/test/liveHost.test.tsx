@@ -1,0 +1,2586 @@
+import { renderHook, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { isPageSlotContext } from '@civitai/app-sdk/blocks';
+
+import { UPLOAD_IMAGE_BYTES_NO_IMAGE_ERROR, useUploadImageBytes } from '../src/hooks/useUploadImageBytes.js';
+import { createLiveHost } from '../src/live.js';
+import { resetTransport } from '../src/testing.js';
+import { getTransport } from '../src/transport/singleton.js';
+import { decodeBlockTokenPayload } from '../src/internal/liveHost.js';
+import type { PickerOverlayHandle } from '../src/internal/pickerOverlay.js';
+import type {
+  BlockCheckpointInfo,
+  BlockInitPayload,
+  BlockResourceInfo,
+  BlockWorkflowSnapshot,
+} from '@civitai/app-sdk/blocks';
+
+/**
+ * Unit coverage for `createLiveHost` (Phase 2 of the dev-token live mode).
+ *
+ * These tests run with NO real network — they inject a mock `fetchImpl` and
+ * assert the live host:
+ *   - forwards each workflow message to the right `blocks.*` tRPC mutation with
+ *     the Bearer block token + the `{ json: { blockToken, body } }` superjson
+ *     envelope, and dispatches the correct reply keyed by `requestId`;
+ *   - maps a backend error into a failed-shape reply (never hangs);
+ *   - builds BLOCK_INIT from the decoded token + a mocked `/blocks/me`;
+ *   - SERVES App-Storage KV via the block-token `apps.storage.*` procs (GET for
+ *     queries, POST for mutations) and FORWARDS SET_USER_CHECKPOINT to
+ *     `blocks.updateUserSettings`;
+ *   - opens a buzz-purchase tab and replies purchased:false (the one remaining
+ *     honest-by-design non-served capability).
+ *
+ * The live host fires inbound replies as `MessageEvent`s on `window`; we listen
+ * directly (no SDK transport / hooks) so the wire contract is asserted at the
+ * postMessage boundary.
+ */
+
+const ORIGIN = window.location.origin;
+
+/** base64url-encode a UTF-8 string (no padding) — for hand-building a fake JWT. */
+function base64url(s: string): string {
+  const b64 =
+    typeof btoa === 'function' ? btoa(s) : Buffer.from(s, 'utf-8').toString('base64');
+  return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/** Build a fake (UNSIGNED) JWT with a controllable payload. */
+function fakeJwt(payload: Record<string, unknown>): string {
+  const header = base64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+  const body = base64url(JSON.stringify(payload));
+  return `${header}.${body}.fake-signature`;
+}
+
+const NOW_SEC = Math.floor(Date.now() / 1000);
+
+const DEFAULT_CLAIMS = {
+  blockId: 'block-abc',
+  appId: 'app_xyz',
+  appBlockId: 'apb_123',
+  blockInstanceId: 'page_apb_123',
+  ctx: { slotId: 'app.page', entityType: 'none' },
+  scopes: ['ai:write:budgeted', 'models:read:self'],
+  buzzBudget: 200,
+  maxBrowsingLevel: 3,
+  sub: 'user:42',
+  iat: NOW_SEC,
+  exp: NOW_SEC + 15 * 60,
+};
+
+const BODY = {
+  kind: 'textToImage' as const,
+  modelId: 7,
+  modelVersionId: 99,
+  params: { prompt: 'a cat' },
+};
+
+/** A tRPC superjson success envelope carrying `{ snapshot }`. */
+function trpcOk(snapshot: BlockWorkflowSnapshot) {
+  return {
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify({ result: { data: { json: { snapshot } } } }),
+    json: async () => ({ result: { data: { json: { snapshot } } } }),
+  } as unknown as Response;
+}
+
+/** A tRPC superjson success envelope carrying an arbitrary plain `data` object. */
+function trpcData(data: unknown) {
+  return {
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify({ result: { data: { json: data } } }),
+    json: async () => ({ result: { data: { json: data } } }),
+  } as unknown as Response;
+}
+
+/** Decode a tRPC GET request's `?input=` querystring back to its `{ json }` payload. */
+function decodeInputParam(url: string): unknown {
+  const q = url.indexOf('?');
+  const params = new URLSearchParams(q >= 0 ? url.slice(q + 1) : '');
+  const raw = params.get('input');
+  return raw == null ? undefined : JSON.parse(raw);
+}
+
+/** A tRPC error envelope (HTTP 500-ish). */
+function trpcErr(message: string, status = 500) {
+  return {
+    ok: false,
+    status,
+    text: async () => JSON.stringify({ error: { json: { message } } }),
+    json: async () => ({ error: { json: { message } } }),
+  } as unknown as Response;
+}
+
+/** A /api/v1/blocks/me success response. */
+function meOk(me: { id: number; username: string | null; status?: string }) {
+  return {
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify(me),
+    json: async () => me,
+  } as unknown as Response;
+}
+
+/** Collect inbound messages the live host dispatches to the block. */
+function collectInbound() {
+  const messages: Array<{ type: string; payload?: Record<string, unknown> }> = [];
+  const listener = (e: MessageEvent) => {
+    if (e.origin !== ORIGIN) return;
+    const data = e.data as { type?: string; payload?: Record<string, unknown> };
+    if (data && typeof data.type === 'string') messages.push({ type: data.type, payload: data.payload });
+  };
+  window.addEventListener('message', listener);
+  return {
+    messages,
+    stop: () => window.removeEventListener('message', listener),
+  };
+}
+
+/** Wait until a message of `type` appears, returning its payload. */
+async function waitForMessage(
+  inbound: ReturnType<typeof collectInbound>,
+  type: string,
+): Promise<Record<string, unknown>> {
+  for (let i = 0; i < 50; i += 1) {
+    const found = inbound.messages.find((m) => m.type === type);
+    if (found) return found.payload ?? {};
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  throw new Error(
+    `timed out waiting for ${type}; saw: ${inbound.messages.map((m) => m.type).join(', ')}`,
+  );
+}
+
+/**
+ * Like {@link waitForMessage} but with a generous budget (~5s) for replies that
+ * land after the live host's POLL retry backoff (250/500/1000ms).
+ */
+async function waitForMessageLong(
+  inbound: ReturnType<typeof collectInbound>,
+  type: string,
+): Promise<Record<string, unknown>> {
+  for (let i = 0; i < 250; i += 1) {
+    const found = inbound.messages.find((m) => m.type === type);
+    if (found) return found.payload ?? {};
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  throw new Error(
+    `timed out waiting for ${type}; saw: ${inbound.messages.map((m) => m.type).join(', ')}`,
+  );
+}
+
+/** Post an outbound message through the patched `window.parent`. */
+function post(type: string, payload: Record<string, unknown>) {
+  window.parent.postMessage({ type, payload }, ORIGIN);
+}
+
+describe('decodeBlockTokenPayload', () => {
+  it('decodes the payload segment of a JWT', () => {
+    const token = fakeJwt(DEFAULT_CLAIMS);
+    const decoded = decodeBlockTokenPayload(token);
+    expect(decoded.blockId).toBe('block-abc');
+    expect(decoded.scopes).toEqual(['ai:write:budgeted', 'models:read:self']);
+    expect(decoded.buzzBudget).toBe(200);
+    expect(decoded.sub).toBe('user:42');
+  });
+
+  it('returns {} for a malformed token', () => {
+    expect(decodeBlockTokenPayload('not-a-jwt')).toEqual({});
+    expect(decodeBlockTokenPayload('')).toEqual({});
+    // A segment that base64url-decodes to non-JSON → {} (never throws).
+    expect(decodeBlockTokenPayload('a.@@@.c')).toEqual({});
+  });
+});
+
+describe('createLiveHost — BLOCK_INIT', () => {
+  let uninstall: (() => void) | undefined;
+  let inbound: ReturnType<typeof collectInbound>;
+
+  beforeEach(() => {
+    inbound = collectInbound();
+  });
+  afterEach(() => {
+    uninstall?.();
+    uninstall = undefined;
+    inbound.stop();
+    vi.restoreAllMocks();
+  });
+
+  it('builds BLOCK_INIT from the decoded token + a mocked /blocks/me', async () => {
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.endsWith('/api/v1/blocks/me')) {
+        return meOk({ id: 42, username: 'dev-mod', status: 'active' });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    }) as unknown as typeof fetch;
+
+    const host = createLiveHost({ blockToken: fakeJwt(DEFAULT_CLAIMS), fetchImpl });
+    uninstall = host.install();
+
+    const payload = (await waitForMessage(inbound, 'BLOCK_INIT')) as unknown as BlockInitPayload;
+    expect(payload.blockId).toBe('block-abc');
+    expect(payload.appId).toBe('app_xyz');
+    expect(payload.blockInstanceId).toBe('page_apb_123');
+    // EXACTLY `{ id, username, signedIn }` — the key set production puts on the
+    // wire (the full note is on `anonFallbackViewer` in `liveHost.ts`):
+    //  - NO `status`. `/api/v1/blocks/me` DID return `status: 'active'` above
+    //    and it is deliberately dropped: the platform withholds the viewer's
+    //    moderation state from third-party iframes (civitai #2521), so a live
+    //    dev host that forwarded it would be more generous than production and
+    //    would let a block read a field it will never get.
+    //  - `signedIn: true`. civitai/civitai `main`'s `withSignedInFlag` stamps it
+    //    on every present viewer (arrived with civitai/civitai#3707, merged
+    //    2026-08-07). Blocks gate with `isSignedIn(viewer)` rather than reading
+    //    the field, but the dev host must still send what production sends.
+    // `toEqual` (not `toMatchObject`) is the assertion that can see the extra
+    // key.
+    expect(payload.viewer).toEqual({ id: 42, username: 'dev-mod', signedIn: true });
+    expect(payload.context.slotId).toBe('app.page');
+    expect(payload.token.raw).toBe(fakeJwt(DEFAULT_CLAIMS));
+    expect(payload.token.scopes).toContain('ai:write:budgeted');
+    expect(payload.token.buzzBudget).toBe(200);
+    expect(payload.maxBrowsingLevel).toBe(3);
+    // /blocks/me was called with the Bearer token.
+    const meCall = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls.find((c) =>
+      String(c[0]).endsWith('/api/v1/blocks/me'),
+    );
+    expect(meCall).toBeTruthy();
+    expect((meCall![1] as RequestInit).headers).toMatchObject({
+      authorization: `Bearer ${fakeJwt(DEFAULT_CLAIMS)}`,
+    });
+  });
+
+  it('default fetch (no fetchImpl) is invoked BOUND to globalThis (no "Illegal invocation")', async () => {
+    // A real browser `fetch` throws "Illegal invocation" when called as a
+    // detached reference; we encode that contract by recording `this`. The
+    // default fetch wrapper must call `globalThis.fetch` as a METHOD
+    // (this === globalThis), not a bare reference (this === undefined under ESM
+    // strict mode), which was the bug that broke the catalog/picker + every
+    // live-host call when no fetchImpl was passed.
+    const calledThis: unknown[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = function (this: unknown) {
+      calledThis.push(this);
+      return Promise.resolve(meOk({ id: 7, username: 'dev', status: 'active' }));
+    } as unknown as typeof fetch;
+    try {
+      const host = createLiveHost({ blockToken: fakeJwt(DEFAULT_CLAIMS) }); // NO fetchImpl
+      uninstall = host.install();
+      await waitForMessage(inbound, 'BLOCK_INIT'); // triggers /blocks/me via the default fetch
+      expect(calledThis.length).toBeGreaterThan(0);
+      for (const t of calledThis) expect(t).toBe(globalThis);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it('falls back to an anon-ish viewer when /blocks/me fails', async () => {
+    const fetchImpl = vi.fn(async () => trpcErr('nope', 401)) as unknown as typeof fetch;
+    const host = createLiveHost({ blockToken: fakeJwt(DEFAULT_CLAIMS), fetchImpl });
+    uninstall = host.install();
+    const payload = (await waitForMessage(inbound, 'BLOCK_INIT')) as unknown as BlockInitPayload;
+    // The FALLBACK path must carry the same key set as the success path — an
+    // exact `toEqual`, not `toMatchObject({ id: 0 })`, which cannot see a
+    // missing `signedIn` or a smuggled `status`.
+    expect(payload.viewer).toEqual({ id: 0, username: 'dev-live', signedIn: true });
+  });
+
+  it('🔴 the DEFAULT page context is complete, and `slug` is not the blockId', async () => {
+    // `PageBlockHost.buildContext()` always sends slug/subPath/viewerUserId/
+    // viewerUsername/theme, so a `{ slotId }` stub would let a page author
+    // compile against fields the harness never delivers — and would no longer
+    // even narrow through `isPageSlotContext`.
+    //
+    // `slug` is a PLACEHOLDER: the block token carries no slug claim, so the
+    // live host cannot know it. It must NOT be filled from `decoded.blockId`
+    // (here 'block-abc') — a blockId is a different identifier in a different
+    // namespace, and a block that built a URL out of it would build a wrong one.
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.endsWith('/api/v1/blocks/me')) return meOk({ id: 42, username: 'dev-mod' });
+      throw new Error(`unexpected fetch ${url}`);
+    }) as unknown as typeof fetch;
+    const host = createLiveHost({ blockToken: fakeJwt(DEFAULT_CLAIMS), fetchImpl, theme: 'light' });
+    uninstall = host.install();
+    const payload = (await waitForMessage(inbound, 'BLOCK_INIT')) as unknown as BlockInitPayload;
+
+    const ctx = payload.context;
+    expect(isPageSlotContext(ctx)).toBe(true);
+    if (!isPageSlotContext(ctx)) throw new Error('expected a page slot context');
+    expect(ctx.slug).not.toBe('block-abc');
+    expect(ctx.slug).toBe('live-dev-app');
+    expect(ctx.subPath).toBe('');
+    expect(ctx.entityType).toBe('none');
+    expect(ctx.viewerUserId).toBe(42);
+    expect(ctx.viewerUsername).toBe('dev-mod');
+    expect(ctx.theme).toBe('light');
+  });
+
+  it('a caller-supplied context that omits `theme` still receives the host theme', async () => {
+    // Kills the mutant that drops the `hostContextWithTheme(...)` call: the
+    // DEFAULT context already carries `theme`, so only a caller-supplied one can
+    // observe the difference.
+    const fetchImpl = vi.fn(async () => meOk({ id: 42, username: 'dev-mod' })) as unknown as typeof fetch;
+    const host = createLiveHost({
+      blockToken: fakeJwt(DEFAULT_CLAIMS),
+      fetchImpl,
+      theme: 'light',
+      context: { slotId: 'app.page', slug: 'seed-explorer', subPath: 'compare/42', viewerUserId: 42 },
+    });
+    uninstall = host.install();
+    const payload = (await waitForMessage(inbound, 'BLOCK_INIT')) as unknown as BlockInitPayload;
+    const ctx = payload.context;
+    if (!isPageSlotContext(ctx)) throw new Error('expected a page slot context');
+    expect(ctx.theme).toBe('light');
+    expect(ctx.slug).toBe('seed-explorer');
+  });
+
+  it('uses an explicit viewer override without fetching /blocks/me', async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not fetch');
+    }) as unknown as typeof fetch;
+    const host = createLiveHost({
+      blockToken: fakeJwt(DEFAULT_CLAIMS),
+      viewer: { id: 7, username: 'override' },
+      fetchImpl,
+    });
+    uninstall = host.install();
+    const payload = (await waitForMessage(inbound, 'BLOCK_INIT')) as unknown as BlockInitPayload;
+    expect(payload.viewer).toEqual({ id: 7, username: 'override' });
+    expect((fetchImpl as unknown as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
+  });
+});
+
+describe('createLiveHost — workflow forwarding', () => {
+  let uninstall: (() => void) | undefined;
+  let inbound: ReturnType<typeof collectInbound>;
+  let fetchMock: ReturnType<typeof vi.fn>;
+  const TOKEN = fakeJwt(DEFAULT_CLAIMS);
+
+  function installWithFetch(impl: (url: string, init?: RequestInit) => Promise<Response>) {
+    fetchMock = vi.fn(impl);
+    const host = createLiveHost({
+      blockToken: TOKEN,
+      viewer: { id: 42, username: 'dev-mod' }, // skip /blocks/me
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+    uninstall = host.install();
+  }
+
+  beforeEach(() => {
+    inbound = collectInbound();
+  });
+  afterEach(() => {
+    uninstall?.();
+    uninstall = undefined;
+    inbound.stop();
+    vi.restoreAllMocks();
+  });
+
+  it('ESTIMATE_WORKFLOW → blocks.estimateWorkflow → ESTIMATE_RESULT keyed by requestId', async () => {
+    installWithFetch(async (url) => {
+      if (url.endsWith('blocks.estimateWorkflow')) {
+        return trpcOk({ workflowId: 'whatif', status: 'pending', cost: { total: 12 } });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('ESTIMATE_WORKFLOW', { requestId: 'r-est', body: BODY });
+    const payload = await waitForMessage(inbound, 'ESTIMATE_RESULT');
+    expect(payload.requestId).toBe('r-est');
+    expect((payload.snapshot as BlockWorkflowSnapshot).cost?.total).toBe(12);
+
+    // Assert URL + Bearer + superjson body envelope.
+    const call = fetchMock.mock.calls.find((c) => String(c[0]).endsWith('blocks.estimateWorkflow'))!;
+    expect(String(call[0])).toBe('https://civitai.com/api/trpc/blocks.estimateWorkflow');
+    const init = call[1] as RequestInit;
+    expect(init.method).toBe('POST');
+    expect(init.headers).toMatchObject({ authorization: `Bearer ${TOKEN}` });
+    expect(JSON.parse(String(init.body))).toEqual({ json: { blockToken: TOKEN, body: BODY } });
+  });
+
+  it('ESTIMATE_WORKFLOW_BATCH → blocks.estimateWorkflowBatch → ESTIMATE_BATCH_RESULT', async () => {
+    const snapshots = [
+      { workflowId: 'wf_estimate', status: 'pending', cost: { total: 12 } },
+      { workflowId: 'failed', status: 'failed', error: 'modelId mismatch with token' },
+    ];
+    const aggregate = { total: 12, pricedCells: 1, cellCount: 2 };
+    installWithFetch(async (url) => {
+      if (url.endsWith('blocks.estimateWorkflowBatch')) {
+        return trpcData({ snapshots, aggregate });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('ESTIMATE_WORKFLOW_BATCH', { requestId: 'r-batch', bodies: [BODY, BODY] });
+    const payload = await waitForMessage(inbound, 'ESTIMATE_BATCH_RESULT');
+    expect(payload).toEqual({ requestId: 'r-batch', snapshots, aggregate });
+
+    const call = fetchMock.mock.calls.find((c) =>
+      String(c[0]).endsWith('blocks.estimateWorkflowBatch'),
+    )!;
+    const init = call[1] as RequestInit;
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(String(init.body))).toEqual({
+      json: { blockToken: TOKEN, bodies: [BODY, BODY] },
+    });
+    // Estimate only: no other procedure was called.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('ESTIMATE_WORKFLOW_BATCH: a whole-call server refusal comes back as `error`', async () => {
+    installWithFetch(async (url) => {
+      if (url.endsWith('blocks.estimateWorkflowBatch')) {
+        return trpcErr('Rate limit exceeded, please retry shortly.', 429);
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('ESTIMATE_WORKFLOW_BATCH', { requestId: 'r-batch-429', bodies: [BODY] });
+    const payload = await waitForMessage(inbound, 'ESTIMATE_BATCH_RESULT');
+    expect(payload).toEqual({
+      requestId: 'r-batch-429',
+      error: 'Rate limit exceeded, please retry shortly.',
+    });
+  });
+
+  it('SUBMIT_WORKFLOW → blocks.submitWorkflow → WORKFLOW_SUBMITTED', async () => {
+    installWithFetch(async (url) => {
+      if (url.endsWith('blocks.submitWorkflow')) {
+        return trpcOk({ workflowId: 'wf_1', status: 'pending' });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('SUBMIT_WORKFLOW', { requestId: 'r-sub', body: BODY });
+    const payload = await waitForMessage(inbound, 'WORKFLOW_SUBMITTED');
+    expect(payload.requestId).toBe('r-sub');
+    expect((payload.snapshot as BlockWorkflowSnapshot).workflowId).toBe('wf_1');
+  });
+
+  it('POLL_WORKFLOW → blocks.pollWorkflow → WORKFLOW_STATUS', async () => {
+    installWithFetch(async (url, init) => {
+      if (url.endsWith('blocks.pollWorkflow')) {
+        const body = JSON.parse(String(init?.body));
+        expect(body).toEqual({ json: { blockToken: TOKEN, workflowId: 'wf_1' } });
+        return trpcOk({
+          workflowId: 'wf_1',
+          status: 'succeeded',
+          imageUrls: ['https://img.test/a.png'],
+        });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('POLL_WORKFLOW', { requestId: 'r-poll', workflowId: 'wf_1' });
+    const payload = await waitForMessage(inbound, 'WORKFLOW_STATUS');
+    expect(payload.requestId).toBe('r-poll');
+    expect((payload.snapshot as BlockWorkflowSnapshot).status).toBe('succeeded');
+    expect((payload.snapshot as BlockWorkflowSnapshot).imageUrls).toEqual([
+      'https://img.test/a.png',
+    ]);
+  });
+
+  it('POLL transient error then success → retries, dispatches the SUCCESS (not failed)', async () => {
+    // The poll's FIRST tRPC call errors (a 500 transport blip — e.g. a
+    // not-yet-rolled-out pod); the retry succeeds. The block must see the
+    // eventual `succeeded` snapshot, NEVER a fabricated terminal `failed`. This
+    // is the round-5 dogfood bug: a poll blip turned a server-side success into
+    // FAILED and stopped the loop.
+    let pollCalls = 0;
+    installWithFetch(async (url) => {
+      if (url.endsWith('blocks.pollWorkflow')) {
+        pollCalls += 1;
+        if (pollCalls === 1) return trpcErr('upstream connect error (503)', 503);
+        return trpcOk({
+          workflowId: 'wf_1',
+          status: 'succeeded',
+          imageUrls: ['https://img.test/ok.png'],
+        });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('POLL_WORKFLOW', { requestId: 'r-retry', workflowId: 'wf_1' });
+    // First retry backoff is 250ms — wait generously.
+    const payload = await waitForMessageLong(inbound, 'WORKFLOW_STATUS');
+    expect(payload.requestId).toBe('r-retry');
+    const snap = payload.snapshot as BlockWorkflowSnapshot;
+    expect(snap.status).toBe('succeeded'); // NOT 'failed'
+    expect(snap.imageUrls).toEqual(['https://img.test/ok.png']);
+    expect(pollCalls).toBe(2); // retried exactly once before succeeding
+  });
+
+  it('POLL with a GENUINE failed status (HTTP 200 snapshot) → terminal failed (no retry)', async () => {
+    // A workflow the orchestrator actually failed comes back as a 200 response
+    // whose snapshot.status is 'failed'. That IS terminal — forward it as-is,
+    // do not retry it as if it were a transport blip.
+    let pollCalls = 0;
+    installWithFetch(async (url) => {
+      if (url.endsWith('blocks.pollWorkflow')) {
+        pollCalls += 1;
+        return trpcOk({ workflowId: 'wf_1', status: 'failed', error: 'NSFW prompt rejected' });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('POLL_WORKFLOW', { requestId: 'r-realfail', workflowId: 'wf_1' });
+    const payload = await waitForMessage(inbound, 'WORKFLOW_STATUS');
+    const snap = payload.snapshot as BlockWorkflowSnapshot;
+    expect(snap.status).toBe('failed');
+    expect(snap.error).toMatch(/NSFW prompt rejected/);
+    expect(pollCalls).toBe(1); // a real failed status is not retried
+  });
+
+  it('POLL transport error that NEVER recovers → keep-polling `processing`, not terminal `failed`', async () => {
+    // Every poll attempt 401s (a backend that stays unreachable through the
+    // retry budget). After the bounded retries the host must NOT fabricate a
+    // terminal `failed` — it replies with a NON-terminal `processing` snapshot
+    // carrying the transient error, so the block's own poll loop keeps trying
+    // and a real outcome can still surface.
+    let pollCalls = 0;
+    installWithFetch(async (url) => {
+      if (url.endsWith('blocks.pollWorkflow')) {
+        pollCalls += 1;
+        return trpcErr('unauthorized (pod not ready)', 401);
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('POLL_WORKFLOW', { requestId: 'r-stuck', workflowId: 'wf_1' });
+    const payload = await waitForMessageLong(inbound, 'WORKFLOW_STATUS');
+    const snap = payload.snapshot as BlockWorkflowSnapshot;
+    expect(snap.status).toBe('processing'); // NON-terminal — keep polling
+    expect(snap.status).not.toBe('failed');
+    expect(snap.workflowId).toBe('wf_1'); // keeps the id so the block maps it back
+    expect(snap.error).toMatch(/unauthorized/);
+    // 1 initial + 3 retries (POLL_RETRY_BACKOFF_MS has 3 entries).
+    expect(pollCalls).toBe(4);
+  });
+
+  it('CANCEL_WORKFLOW → blocks.cancelWorkflow → WORKFLOW_CANCELED', async () => {
+    installWithFetch(async (url) => {
+      if (url.endsWith('blocks.cancelWorkflow')) {
+        return trpcOk({ workflowId: 'wf_1', status: 'canceled' });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('CANCEL_WORKFLOW', { requestId: 'r-cancel', workflowId: 'wf_1' });
+    const payload = await waitForMessage(inbound, 'WORKFLOW_CANCELED');
+    expect(payload.requestId).toBe('r-cancel');
+    expect((payload.snapshot as BlockWorkflowSnapshot).status).toBe('canceled');
+  });
+
+  it('a backend ERROR maps to a failed-shape reply (no hang)', async () => {
+    installWithFetch(async (url) => {
+      if (url.endsWith('blocks.submitWorkflow')) {
+        return trpcErr('orchestrator exploded');
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('SUBMIT_WORKFLOW', { requestId: 'r-fail', body: BODY });
+    const payload = await waitForMessage(inbound, 'WORKFLOW_SUBMITTED');
+    expect(payload.requestId).toBe('r-fail');
+    const snap = payload.snapshot as BlockWorkflowSnapshot;
+    expect(snap.status).toBe('failed');
+    expect(snap.workflowId).toBe('failed'); // non-empty sentinel so the SDK doesn't drop it
+    expect(snap.error).toMatch(/orchestrator exploded/);
+  });
+
+  it('a network throw maps to a failed-shape reply', async () => {
+    installWithFetch(async (url) => {
+      if (url.endsWith('blocks.estimateWorkflow')) throw new TypeError('network down');
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('ESTIMATE_WORKFLOW', { requestId: 'r-net', body: BODY });
+    const payload = await waitForMessage(inbound, 'ESTIMATE_RESULT');
+    const snap = payload.snapshot as BlockWorkflowSnapshot;
+    expect(snap.status).toBe('failed');
+    expect(snap.error).toMatch(/network down/);
+  });
+});
+
+describe('createLiveHost — token + non-forwarded messages', () => {
+  let uninstall: (() => void) | undefined;
+  let inbound: ReturnType<typeof collectInbound>;
+  const TOKEN = fakeJwt(DEFAULT_CLAIMS);
+
+  /** Returned so a case can assert that NO HTTP was attempted for its message. */
+  function install(extra?: { token?: string }) {
+    const fetchImpl = vi.fn(async () => meOk({ id: 42, username: 'm' }));
+    const host = createLiveHost({
+      blockToken: extra?.token ?? TOKEN,
+      viewer: { id: 42, username: 'm' },
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    uninstall = host.install();
+    return fetchImpl;
+  }
+
+  beforeEach(() => {
+    inbound = collectInbound();
+  });
+  afterEach(() => {
+    uninstall?.();
+    uninstall = undefined;
+    inbound.stop();
+    vi.restoreAllMocks();
+  });
+
+  it('REQUEST_TOKEN echoes the pasted token wrapped, keyed by requestId', async () => {
+    install();
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('REQUEST_TOKEN', { requestId: 'r-tok', blockInstanceId: 'page_apb_123' });
+    const payload = await waitForMessage(inbound, 'TOKEN_REFRESH_RESPONSE');
+    expect(payload.requestId).toBe('r-tok');
+    expect((payload.token as { raw: string }).raw).toBe(TOKEN);
+    expect((payload.token as { scopes: string[] }).scopes).toContain('ai:write:budgeted');
+  });
+
+  it('REQUEST_TOKEN on an EXPIRED token still echoes it (backend will 401)', async () => {
+    const expiredToken = fakeJwt({ ...DEFAULT_CLAIMS, exp: NOW_SEC - 10 });
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    install({ token: expiredToken });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('REQUEST_TOKEN', { requestId: 'r-exp', blockInstanceId: 'x' });
+    const payload = await waitForMessage(inbound, 'TOKEN_REFRESH_RESPONSE');
+    expect((payload.token as { raw: string }).raw).toBe(expiredToken);
+    expect(errSpy).toHaveBeenCalled(); // actionable "re-mint" error logged
+  });
+
+  it('OPEN_BUZZ_PURCHASE opens a tab + replies purchased:false', async () => {
+    const openSpy = vi.spyOn(window, 'open').mockImplementation(() => null);
+    install();
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('OPEN_BUZZ_PURCHASE', { requestId: 'r-buy', suggestedAmount: 100 });
+    const payload = await waitForMessage(inbound, 'BUZZ_PURCHASE_RESULT');
+    expect(payload.requestId).toBe('r-buy');
+    expect(payload.purchased).toBe(false);
+    expect(openSpy).toHaveBeenCalledWith('https://civitai.com/purchase/buzz', '_blank');
+  });
+
+  it('SET_COLLECTION_FOLLOW is REFUSED, never routed to the scoped HTTP endpoint', async () => {
+    // 🔴 The refusal is the point. This harness holds a block token and COULD
+    // call the legacy `collections:write:self` HTTP endpoint — a path with NO
+    // consent confirm. Doing so would let dev prove out a flow production does
+    // not have, and a block would ship having never handled `declined`.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fetchImpl = install();
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    const fetchCallsBefore = fetchImpl.mock.calls.length;
+
+    post('SET_COLLECTION_FOLLOW', { requestId: 'r-follow', collectionId: 7, follow: true });
+    const payload = await waitForMessage(inbound, 'COLLECTION_FOLLOW_RESULT');
+
+    expect(payload.requestId).toBe('r-follow');
+    expect(payload.error).toBe('collection-unavailable');
+    expect(payload.result).toBeUndefined();
+    // No HTTP was attempted for it at all.
+    expect(fetchImpl.mock.calls.length).toBe(fetchCallsBefore);
+    expect(warnSpy).toHaveBeenCalled();
+  });
+
+  it('TRACK_EVENT / REQUEST_SIGN_IN / BLOCK_ERROR are no-op (no reply, no throw)', async () => {
+    install();
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    const before = inbound.messages.length;
+    post('TRACK_EVENT', { eventName: 'x' });
+    post('REQUEST_SIGN_IN', {});
+    post('BLOCK_ERROR', { message: 'boom', fatal: false });
+    // Give any (incorrect) replies a tick to land.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(inbound.messages.length).toBe(before);
+  });
+
+  it('REQUEST_CONSENT logs an actionable error (live mode cannot grant) — no reply', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    install();
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    const before = inbound.messages.length;
+    // NOTE (post-CONSENT_UNAVAILABLE): `DEFAULT_CLAIMS` ALREADY carries
+    // `ai:write:budgeted`, so this is the BENIGN re-request — the block asked
+    // for a scope it already holds. That is why nothing is pushed here, and it
+    // is the behaviour we want: a refusal rendered over a permission that works
+    // is worse than silence. The refusal path is covered below with a token that
+    // genuinely lacks the scope.
+    post('REQUEST_CONSENT', { scopes: ['ai:write:budgeted'] });
+    await new Promise((r) => setTimeout(r, 20));
+    // No reply dispatched (can't grant), but a clear warning is logged.
+    expect(inbound.messages.length).toBe(before);
+    const logged = warnSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(logged).toMatch(/REQUEST_CONSENT/);
+    expect(logged).toMatch(/civitai login --token/);
+  });
+
+  it('REQUEST_CONSENT for a scope the token LACKS pushes CONSENT_UNAVAILABLE', async () => {
+    // 🔴 Live mode can grant NOTHING — there is no consent UI to open and no way
+    // to re-mint a token with a scope it does not carry. So every request for a
+    // scope the token lacks is permanently un-grantable, and before this push the
+    // only trace was a `console.warn` in the DEV's devtools: the block's own UI
+    // went on telling the user to click Generate again. Emitting it here is what
+    // makes a refusal handler written against production reachable in
+    // `pnpm dev:live` at all.
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const readOnly = fakeJwt({ ...DEFAULT_CLAIMS, scopes: ['user:read:self'], buzzBudget: undefined });
+    install({ token: readOnly });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('REQUEST_CONSENT', { scopes: ['ai:write:budgeted', 'buzz:read:self'] });
+    const payload = await waitForMessage(inbound, 'CONSENT_UNAVAILABLE');
+    expect(payload).toEqual({
+      reason: 'ungrantable',
+      scopes: ['ai:write:budgeted', 'buzz:read:self'],
+    });
+  });
+
+  it('🔴 REQUEST_CONSENT naming only UNKNOWN scopes still pushes, with scopes: []', async () => {
+    // The trap, at the live host. `notify` is decided on the UNFILTERED set, so
+    // an un-grantable scope outside the platform vocabulary still refuses out
+    // loud — only the NAMES are filtered, because the hint is untrusted block
+    // input and this payload is rendered by block UI.
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const readOnly = fakeJwt({ ...DEFAULT_CLAIMS, scopes: ['user:read:self'], buzzBudget: undefined });
+    install({ token: readOnly });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('REQUEST_CONSENT', {
+      scopes: ['<img src=x onerror=alert(1)>', 'not:a:real:scope', 'A'.repeat(5000)],
+    });
+    const payload = await waitForMessage(inbound, 'CONSENT_UNAVAILABLE');
+    expect(payload).toEqual({ reason: 'ungrantable', scopes: [] });
+  });
+
+  it('REQUEST_CONSENT with NO scopes hint pushes nothing (still logs)', async () => {
+    // Without an explicit requested scope proven un-grantable there is no way to
+    // tell "already granted" from "clamped", so the host stays silent rather
+    // than guessing.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const readOnly = fakeJwt({ ...DEFAULT_CLAIMS, scopes: ['user:read:self'], buzzBudget: undefined });
+    install({ token: readOnly });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('REQUEST_CONSENT', {});
+    await new Promise((r) => setTimeout(r, 20));
+    expect(inbound.messages.filter((m) => m.type === 'CONSENT_UNAVAILABLE')).toHaveLength(0);
+    // The log still fires — it is unconditional and unchanged by this PR.
+    expect(warnSpy.mock.calls.map((c) => String(c[0])).join('\n')).toMatch(/REQUEST_CONSENT/);
+
+    // POSITIVE CONTROL for the zero above: the SAME host + SAME collector DOES
+    // deliver a CONSENT_UNAVAILABLE when the hint names an un-grantable scope,
+    // so the empty filter result is a real silence and not a probe wired to
+    // nothing.
+    post('REQUEST_CONSENT', { scopes: ['ai:write:budgeted'] });
+    const payload = await waitForMessage(inbound, 'CONSENT_UNAVAILABLE');
+    expect(payload).toEqual({ reason: 'ungrantable', scopes: ['ai:write:budgeted'] });
+  });
+});
+
+describe('createLiveHost — read-only token startup warning', () => {
+  let uninstall: (() => void) | undefined;
+  afterEach(() => {
+    uninstall?.();
+    uninstall = undefined;
+    vi.restoreAllMocks();
+  });
+
+  function install(token: string) {
+    const host = createLiveHost({
+      blockToken: token,
+      viewer: { id: 42, username: 'm' },
+      fetchImpl: vi.fn(async () => meOk({ id: 42, username: 'm' })) as unknown as typeof fetch,
+    });
+    uninstall = host.install();
+  }
+
+  it('warns up front when the token lacks ai:write:budgeted (OAuth-minted)', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const readOnly = fakeJwt({ ...DEFAULT_CLAIMS, scopes: ['user:read:self'], buzzBudget: undefined });
+    install(readOnly);
+    const logged = warnSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(logged).toMatch(/READ-ONLY/);
+    expect(logged).toMatch(/ai:write:budgeted/);
+    expect(logged).toMatch(/civitai login --token/);
+  });
+
+  it('does NOT warn for a spendable (personal-key-minted) token', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    install(fakeJwt(DEFAULT_CLAIMS));
+    const logged = warnSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(logged).not.toMatch(/READ-ONLY/);
+  });
+});
+
+describe('createLiveHost — picker (serves the catalog locally, no longer a stub)', () => {
+  let uninstall: (() => void) | undefined;
+  let inbound: ReturnType<typeof collectInbound>;
+  const TOKEN = fakeJwt(DEFAULT_CLAIMS);
+
+  /** A /api/v1/blocks/models (or /api/v1/models) catalog page response. */
+  function catalogOk(items: unknown[], nextCursor: string | null = null) {
+    const body = { items, metadata: { nextCursor } };
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify(body),
+      json: async () => body,
+    } as unknown as Response;
+  }
+
+  const CKPT_MODEL = {
+    id: 100,
+    name: 'Awesome XL',
+    type: 'Checkpoint',
+    nsfw: false,
+    modelVersions: [
+      {
+        id: 9001,
+        name: 'v2.0',
+        baseModel: 'SDXL 1.0',
+        images: [{ url: 'https://image.civitai.com/a/original=true/x.jpeg' }],
+      },
+    ],
+  };
+  const LORA_MODEL = {
+    id: 300,
+    name: 'Cool LoRA',
+    type: 'LORA',
+    nsfw: false,
+    modelVersions: [{ id: 7777, name: 'v1', baseModel: 'SDXL 1.0', images: [] }],
+  };
+
+  /**
+   * Install a live host whose fetch answers /blocks/me, the catalog endpoints,
+   * and (optionally) records which catalog URLs were hit. `onPickerReady` is the
+   * test seam — it drives the overlay programmatically once it's loaded.
+   */
+  function install(
+    items: unknown[],
+    onPickerReady: (h: PickerOverlayHandle) => void,
+    sink?: { urls: string[] },
+  ) {
+    const fetchImpl = vi.fn(async (url: string) => {
+      sink?.urls.push(url);
+      if (url.includes('/api/v1/blocks/models') || url.endsWith('/api/v1/models') || url.includes('/api/v1/models?')) {
+        return catalogOk(items);
+      }
+      return meOk({ id: 42, username: 'm' });
+    }) as unknown as typeof fetch;
+    const host = createLiveHost({
+      blockToken: TOKEN,
+      viewer: { id: 42, username: 'm' },
+      fetchImpl,
+      onPickerReady,
+    });
+    uninstall = host.install();
+    return fetchImpl as unknown as ReturnType<typeof vi.fn>;
+  }
+
+  beforeEach(() => {
+    inbound = collectInbound();
+  });
+  afterEach(() => {
+    uninstall?.();
+    uninstall = undefined;
+    inbound.stop();
+    vi.restoreAllMocks();
+  });
+
+  it('OPEN_CHECKPOINT_PICKER does NOT reply "not supported", fetches the catalog, and on a pick dispatches a correctly-shaped selected', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const sink = { urls: [] as string[] };
+    const fetchImpl = install([CKPT_MODEL], (h) => h.selectFirst(), sink);
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('OPEN_CHECKPOINT_PICKER', { requestId: 'r-ckpt', baseModelGroup: 'SDXL' });
+    const payload = await waitForMessage(inbound, 'CHECKPOINT_PICKER_RESULT');
+
+    // (a) not the old stub — a real selection landed.
+    expect(payload.requestId).toBe('r-ckpt');
+    const selected = payload.selected as BlockCheckpointInfo;
+    expect(selected).toEqual({
+      versionId: 9001,
+      modelId: 100,
+      modelName: 'Awesome XL',
+      versionName: 'v2.0',
+      baseModel: 'SDXL 1.0',
+    });
+
+    // (b) the catalog was fetched via the AUTHORITATIVE blocks endpoint w/ Bearer.
+    const catalogCall = fetchImpl.mock.calls.find((c) =>
+      String(c[0]).includes('/api/v1/blocks/models'),
+    );
+    expect(catalogCall).toBeTruthy();
+    expect(String(catalogCall![0])).toContain('types=Checkpoint');
+    expect((catalogCall![1] as RequestInit).headers).toMatchObject({
+      Authorization: `Bearer ${TOKEN}`,
+    });
+
+    // The old NOT_SUPPORTED warning must NOT have fired.
+    const logged = warnSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(logged).not.toMatch(/not supported/i);
+  });
+
+  it('OPEN_CHECKPOINT_PICKER dismissal yields NO selected', async () => {
+    install([CKPT_MODEL], (h) => h.dismiss());
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('OPEN_CHECKPOINT_PICKER', { requestId: 'r-dismiss', baseModelGroup: 'SDXL' });
+    const payload = await waitForMessage(inbound, 'CHECKPOINT_PICKER_RESULT');
+    expect(payload.requestId).toBe('r-dismiss');
+    expect(payload.selected).toBeUndefined();
+  });
+
+  it('OPEN_RESOURCE_PICKER (LORA) fetches the catalog and dispatches a BlockResourceInfo on pick', async () => {
+    const fetchImpl = install([LORA_MODEL], (h) => h.selectFirst());
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('OPEN_RESOURCE_PICKER', { requestId: 'r-lora', resourceType: 'LORA' });
+    const payload = await waitForMessage(inbound, 'RESOURCE_PICKER_RESULT');
+    expect(payload.requestId).toBe('r-lora');
+    const selected = payload.selected as BlockResourceInfo;
+    expect(selected).toEqual({
+      versionId: 7777,
+      modelId: 300,
+      modelName: 'Cool LoRA',
+      versionName: 'v1',
+      baseModel: 'SDXL 1.0',
+      modelType: 'LORA',
+    });
+    const catalogCall = fetchImpl.mock.calls.find((c) =>
+      String(c[0]).includes('/api/v1/blocks/models'),
+    );
+    expect(String(catalogCall![0])).toContain('types=LORA');
+  });
+
+  // ── #391 ────────────────────────────────────────────────────────────────
+  // The live picker branched its converter on the REQUESTED MODEL TYPE, not on
+  // the channel it replies to. So `OPEN_RESOURCE_PICKER { resourceType:
+  // 'Checkpoint' }` — a legitimate, common request — took the `Checkpoint`
+  // branch and dispatched a `cardToCheckpoint()` projection (5 fields) under
+  // `RESOURCE_PICKER_RESULT`, where consumers read `BlockResourceInfo`. The
+  // REQUIRED `modelType` was therefore `undefined` and failed at use.
+  //
+  // RED AT BASE with "expected undefined to be 'Checkpoint'". `tsc` could not
+  // see it: the branch is a runtime string comparison and the two converters
+  // return different declared types, so no call site was ever checked against
+  // the channel it replies on.
+  it('OPEN_RESOURCE_PICKER (Checkpoint) dispatches a BlockResourceInfo WITH modelType (#391)', async () => {
+    install([CKPT_MODEL], (h) => h.selectFirst());
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('OPEN_RESOURCE_PICKER', { requestId: 'r-res-ckpt', resourceType: 'Checkpoint' });
+    const payload = await waitForMessage(inbound, 'RESOURCE_PICKER_RESULT');
+
+    expect(payload.requestId).toBe('r-res-ckpt');
+    const selected = payload.selected as BlockResourceInfo;
+    // The single field the bug dropped, asserted on its own first so a failure
+    // names it rather than printing a whole-object diff.
+    expect(selected.modelType).toBe('Checkpoint');
+    // And the WHOLE payload, so a future converter swap that adds or drops a
+    // field is loud too.
+    expect(selected).toEqual({
+      versionId: 9001,
+      modelId: 100,
+      modelName: 'Awesome XL',
+      versionName: 'v2.0',
+      baseModel: 'SDXL 1.0',
+      modelType: 'Checkpoint',
+    });
+  });
+
+  // The other half of #391's fix: passing the channel down must not make the
+  // two channels return the SAME shape. A Checkpoint-typed request on the
+  // CHECKPOINT channel still gets the narrow `BlockCheckpointInfo` projection —
+  // no `modelType`, which that interface does not declare.
+  //
+  // GREEN AT BASE AND AT HEAD by design: this is the no-regression half, and it
+  // is an invariant guard, not regression coverage. It is what would have gone
+  // red had the fix been "just make `cardToCheckpoint` populate `modelType`".
+  it('CHECKPOINT channel still gets the narrow BlockCheckpointInfo (no modelType) (#391)', async () => {
+    install([CKPT_MODEL], (h) => h.selectFirst());
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('OPEN_CHECKPOINT_PICKER', { requestId: 'r-ckpt-shape', baseModelGroup: 'SDXL' });
+    const payload = await waitForMessage(inbound, 'CHECKPOINT_PICKER_RESULT');
+
+    const selected = payload.selected as Record<string, unknown>;
+    expect(Object.keys(selected).sort()).toEqual([
+      'baseModel',
+      'modelId',
+      'modelName',
+      'versionId',
+      'versionName',
+    ]);
+    expect('modelType' in selected).toBe(false);
+  });
+
+  it('OPEN_RESOURCE_PICKER dismissal yields NO selected', async () => {
+    install([LORA_MODEL], (h) => h.dismiss());
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('OPEN_RESOURCE_PICKER', { requestId: 'r-lora-x', resourceType: 'LORA' });
+    const payload = await waitForMessage(inbound, 'RESOURCE_PICKER_RESULT');
+    expect(payload.requestId).toBe('r-lora-x');
+    expect(payload.selected).toBeUndefined();
+  });
+
+  // ── Multi-select (`multiple: { max }`) ────────────────────────────────────
+  // Three LoRAs whose ids are NOT in catalog order, so a reply that follows the
+  // catalog (or sorts) instead of the staging order is visible.
+  const LORAS = [
+    { id: 310, name: 'Alpha', type: 'LORA', nsfw: false, modelVersions: [{ id: 5001, name: 'v1', baseModel: 'SDXL 1.0', images: [] }] },
+    { id: 320, name: 'Bravo', type: 'LORA', nsfw: false, modelVersions: [{ id: 5002, name: 'v2', baseModel: 'SDXL 1.0', images: [] }] },
+    { id: 330, name: 'Charlie', type: 'LORA', nsfw: false, modelVersions: [{ id: 5003, name: 'v3', baseModel: 'SDXL 1.0', images: [] }] },
+  ];
+
+  it('OPEN_RESOURCE_PICKER with `multiple` replies with the staged list in STAGING order', async () => {
+    install(LORAS, (h) => {
+      h.toggleStagedByVersionId(5003);
+      h.toggleStagedByVersionId(5001);
+      h.commitStaged();
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('OPEN_RESOURCE_PICKER', { requestId: 'r-multi', resourceType: 'LORA', multiple: { max: 3 } });
+    const payload = await waitForMessage(inbound, 'RESOURCE_PICKER_RESULT');
+    expect(payload).toEqual({
+      requestId: 'r-multi',
+      selectedResources: [
+        { versionId: 5003, modelId: 330, modelName: 'Charlie', versionName: 'v3', baseModel: 'SDXL 1.0', modelType: 'LORA' },
+        { versionId: 5001, modelId: 310, modelName: 'Alpha', versionName: 'v1', baseModel: 'SDXL 1.0', modelType: 'LORA' },
+      ],
+    });
+  });
+
+  it('`multiple` never stages past max, and un-staging frees a slot', async () => {
+    let staged: readonly number[] = [];
+    install(LORAS, (h) => {
+      h.toggleStagedByVersionId(5002);
+      h.toggleStagedByVersionId(5003);
+      h.toggleStagedByVersionId(5001); // over max:2 — ignored
+      staged = [...h.stagedVersionIds];
+      h.toggleStagedByVersionId(5002); // un-stage
+      h.toggleStagedByVersionId(5001); // now fits, and lands LAST
+      h.commitStaged();
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('OPEN_RESOURCE_PICKER', { requestId: 'r-multi-max', resourceType: 'LORA', multiple: { max: 2 } });
+    const payload = await waitForMessage(inbound, 'RESOURCE_PICKER_RESULT');
+    expect(staged).toEqual([5002, 5003]);
+    expect((payload.selectedResources as BlockResourceInfo[]).map((r) => r.versionId)).toEqual([5003, 5001]);
+  });
+
+  it('`multiple` dismissal replies with an EMPTY list, not a bare payload', async () => {
+    install(LORAS, (h) => h.dismiss());
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('OPEN_RESOURCE_PICKER', { requestId: 'r-multi-x', resourceType: 'LORA', multiple: { max: 2 } });
+    const payload = await waitForMessage(inbound, 'RESOURCE_PICKER_RESULT');
+    expect(payload).toEqual({ requestId: 'r-multi-x', selectedResources: [] });
+  });
+
+  it('`multiple` with a Checkpoint is refused with an error and no overlay opens', async () => {
+    const onReady = vi.fn();
+    install([CKPT_MODEL], onReady);
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('OPEN_RESOURCE_PICKER', { requestId: 'r-multi-ckpt', resourceType: 'Checkpoint', multiple: { max: 2 } });
+    const payload = await waitForMessage(inbound, 'RESOURCE_PICKER_RESULT');
+    expect(payload).toEqual({
+      requestId: 'r-multi-ckpt',
+      error:
+        'OPEN_RESOURCE_PICKER: multiple is only supported for LoRA-family resource types, not Checkpoint.',
+    });
+    expect(document.querySelector('[data-live-picker-overlay]')).toBeNull();
+    expect(onReady).not.toHaveBeenCalled();
+  });
+
+  it('`multiple` overlay: clicking cards stages them and the commit button sends the list', async () => {
+    let captured: PickerOverlayHandle | undefined;
+    install(LORAS, (h) => {
+      captured = h;
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('OPEN_RESOURCE_PICKER', { requestId: 'r-multi-dom', resourceType: 'LORA', multiple: { max: 2 } });
+    for (let i = 0; i < 50 && !captured; i += 1) await new Promise((r) => setTimeout(r, 5));
+    expect(captured).toBeTruthy();
+
+    const commit = document.querySelector('[data-picker-commit]') as HTMLButtonElement;
+    expect(commit.disabled).toBe(true);
+    (document.querySelector('[data-picker-card="5002"]') as HTMLElement).click();
+    // A card click STAGES in multi-select mode — the overlay must still be open.
+    expect(document.querySelector('[data-live-picker-overlay]')).not.toBeNull();
+    expect(document.querySelector('[data-picker-card="5002"]')!.getAttribute('aria-pressed')).toBe('true');
+    (document.querySelector('[data-picker-card="5001"]') as HTMLElement).click();
+    expect(commit.disabled).toBe(false);
+    expect(commit.textContent).toBe('Add 2 of 2');
+
+    commit.click();
+    const payload = await waitForMessage(inbound, 'RESOURCE_PICKER_RESULT');
+    expect((payload.selectedResources as BlockResourceInfo[]).map((r) => r.versionId)).toEqual([5002, 5001]);
+    expect(document.querySelector('[data-live-picker-overlay]')).toBeNull();
+  });
+
+  it('mounts an overlay into the document and tears it down on selection', async () => {
+    let captured: PickerOverlayHandle | undefined;
+    install([CKPT_MODEL], (h) => {
+      captured = h;
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('OPEN_CHECKPOINT_PICKER', { requestId: 'r-dom', baseModelGroup: 'SDXL' });
+
+    // Wait for the overlay to be ready (catalog loaded) → DOM node present.
+    for (let i = 0; i < 50 && !captured; i += 1) await new Promise((r) => setTimeout(r, 5));
+    expect(captured).toBeTruthy();
+    expect(document.querySelector('[data-live-picker-overlay]')).not.toBeNull();
+    // A clickable card exists for the loaded model.
+    expect(document.querySelector('[data-picker-card="9001"]')).not.toBeNull();
+
+    // Pick → overlay unmounts + a result lands.
+    captured!.selectByVersionId(9001);
+    const payload = await waitForMessage(inbound, 'CHECKPOINT_PICKER_RESULT');
+    expect((payload.selected as BlockCheckpointInfo).versionId).toBe(9001);
+    expect(document.querySelector('[data-live-picker-overlay]')).toBeNull();
+  });
+
+  it('host teardown closes an open overlay (no leaked DOM, dismissal result)', async () => {
+    let captured: PickerOverlayHandle | undefined;
+    install([CKPT_MODEL], (h) => {
+      captured = h;
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('OPEN_CHECKPOINT_PICKER', { requestId: 'r-teardown', baseModelGroup: 'SDXL' });
+    for (let i = 0; i < 50 && !captured; i += 1) await new Promise((r) => setTimeout(r, 5));
+    expect(document.querySelector('[data-live-picker-overlay]')).not.toBeNull();
+
+    uninstall?.();
+    uninstall = undefined;
+    expect(document.querySelector('[data-live-picker-overlay]')).toBeNull();
+    expect(captured!.resolved).toBe(true);
+  });
+});
+
+describe('createLiveHost — App-Storage KV (served via apps.storage.*)', () => {
+  let uninstall: (() => void) | undefined;
+  let inbound: ReturnType<typeof collectInbound>;
+  let fetchMock: ReturnType<typeof vi.fn>;
+  const TOKEN = fakeJwt(DEFAULT_CLAIMS);
+
+  function installWithFetch(impl: (url: string, init?: RequestInit) => Promise<Response>) {
+    fetchMock = vi.fn(impl);
+    const host = createLiveHost({
+      blockToken: TOKEN,
+      viewer: { id: 42, username: 'dev-mod' }, // skip /blocks/me
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+    uninstall = host.install();
+  }
+
+  beforeEach(() => {
+    inbound = collectInbound();
+  });
+  afterEach(() => {
+    uninstall?.();
+    uninstall = undefined;
+    inbound.stop();
+    vi.restoreAllMocks();
+  });
+
+  it('APP_STORAGE_GET → apps.storage.get (GET, ?input) → value', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('apps.storage.get')) return trpcData({ value: { theme: 'dark' } });
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('APP_STORAGE_GET', { requestId: 'r-g', key: 'prefs' });
+    const payload = await waitForMessage(inbound, 'APP_STORAGE_GET_RESULT');
+    expect(payload.requestId).toBe('r-g');
+    expect(payload.value).toEqual({ theme: 'dark' });
+
+    const call = fetchMock.mock.calls.find((c) => String(c[0]).includes('apps.storage.get'))!;
+    // GET — no body, input in the querystring.
+    expect((call[1] as RequestInit).method).toBe('GET');
+    expect((call[1] as RequestInit).body).toBeUndefined();
+    expect(String(call[0])).toContain('/api/trpc/apps.storage.get?input=');
+    expect((call[1] as RequestInit).headers).toMatchObject({ authorization: `Bearer ${TOKEN}` });
+    expect(decodeInputParam(String(call[0]))).toEqual({ json: { blockToken: TOKEN, key: 'prefs' } });
+  });
+
+  it('APP_STORAGE_GET missing value → null', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('apps.storage.get')) return trpcData({ value: null });
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('APP_STORAGE_GET', { requestId: 'r-g2', key: 'missing' });
+    const payload = await waitForMessage(inbound, 'APP_STORAGE_GET_RESULT');
+    expect(payload.value).toBeNull();
+    expect(payload.error).toBeUndefined();
+  });
+
+  it('APP_STORAGE_SET → apps.storage.set (POST body) → ok:true + sizeBytes', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('apps.storage.set')) return trpcData({ ok: true, sizeBytes: 17 });
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('APP_STORAGE_SET', { requestId: 'r-s', key: 'prefs', value: { theme: 'dark' } });
+    const payload = await waitForMessage(inbound, 'APP_STORAGE_SET_RESULT');
+    expect(payload.requestId).toBe('r-s');
+    expect(payload.ok).toBe(true);
+    expect(payload.sizeBytes).toBe(17);
+
+    const call = fetchMock.mock.calls.find((c) => String(c[0]).includes('apps.storage.set'))!;
+    expect((call[1] as RequestInit).method).toBe('POST');
+    expect(String(call[0])).toBe('https://civitai.com/api/trpc/apps.storage.set');
+    expect(JSON.parse(String((call[1] as RequestInit).body))).toEqual({
+      json: { blockToken: TOKEN, key: 'prefs', value: { theme: 'dark' } },
+    });
+  });
+
+  it('APP_STORAGE_SET without a backend sizeBytes → ok:true, sizeBytes omitted', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('apps.storage.set')) return trpcData({ ok: true });
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('APP_STORAGE_SET', { requestId: 'r-s2', key: 'k', value: 1 });
+    const payload = await waitForMessage(inbound, 'APP_STORAGE_SET_RESULT');
+    expect(payload.ok).toBe(true);
+    expect('sizeBytes' in payload).toBe(false);
+  });
+
+  it('APP_STORAGE_DELETE → apps.storage.delete (POST) → ok + deleted', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('apps.storage.delete')) return trpcData({ ok: true, deleted: true });
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('APP_STORAGE_DELETE', { requestId: 'r-d', key: 'prefs' });
+    const payload = await waitForMessage(inbound, 'APP_STORAGE_DELETE_RESULT');
+    expect(payload.requestId).toBe('r-d');
+    expect(payload.ok).toBe(true);
+    expect(payload.deleted).toBe(true);
+
+    const call = fetchMock.mock.calls.find((c) => String(c[0]).includes('apps.storage.delete'))!;
+    expect((call[1] as RequestInit).method).toBe('POST');
+    expect(JSON.parse(String((call[1] as RequestInit).body))).toEqual({
+      json: { blockToken: TOKEN, key: 'prefs' },
+    });
+  });
+
+  it('APP_STORAGE_DELETE of an absent key → ok:true, deleted:false', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('apps.storage.delete')) return trpcData({ ok: true, deleted: false });
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('APP_STORAGE_DELETE', { requestId: 'r-d2', key: 'gone' });
+    const payload = await waitForMessage(inbound, 'APP_STORAGE_DELETE_RESULT');
+    expect(payload.ok).toBe(true);
+    expect(payload.deleted).toBe(false);
+  });
+
+  it('APP_STORAGE_LIST → apps.storage.list (GET) → keys (ISO updatedAt) + nextCursor', async () => {
+    const updated = new Date('2026-06-27T12:00:00.000Z');
+    installWithFetch(async (url) => {
+      if (url.includes('apps.storage.list')) {
+        return trpcData({
+          keys: [{ key: 'a', updatedAt: updated }],
+          nextCursor: 'Y3Vyc29y',
+        });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('APP_STORAGE_LIST', { requestId: 'r-l', prefix: 'pre', limit: 10, cursor: 'cur' });
+    const payload = await waitForMessage(inbound, 'APP_STORAGE_LIST_RESULT');
+    expect(payload.requestId).toBe('r-l');
+    expect(payload.keys).toEqual([{ key: 'a', updatedAt: '2026-06-27T12:00:00.000Z' }]);
+    expect(payload.nextCursor).toBe('Y3Vyc29y');
+
+    const call = fetchMock.mock.calls.find((c) => String(c[0]).includes('apps.storage.list'))!;
+    expect((call[1] as RequestInit).method).toBe('GET');
+    // limit clamped + prefix/cursor included as strings.
+    expect(decodeInputParam(String(call[0]))).toEqual({
+      json: { blockToken: TOKEN, limit: 10, prefix: 'pre', cursor: 'cur' },
+    });
+  });
+
+  it('APP_STORAGE_LIST clamps the limit + drops a partial-page nextCursor', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('apps.storage.list')) return trpcData({ keys: [], nextCursor: undefined });
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('APP_STORAGE_LIST', { requestId: 'r-l2', limit: 9999 });
+    const payload = await waitForMessage(inbound, 'APP_STORAGE_LIST_RESULT');
+    expect(payload.keys).toEqual([]);
+    expect('nextCursor' in payload).toBe(false);
+    const call = fetchMock.mock.calls.find((c) => String(c[0]).includes('apps.storage.list'))!;
+    // 9999 clamped to 200; no prefix/cursor keys present.
+    expect(decodeInputParam(String(call[0]))).toEqual({ json: { blockToken: TOKEN, limit: 200 } });
+  });
+
+  it('APP_STORAGE_QUOTA → apps.storage.getQuota (GET) → the 4 numbers', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('apps.storage.getQuota')) {
+        return trpcData({ usedBytes: 12, rowCount: 3, limitBytes: 50_000_000, limitRows: 1000 });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('APP_STORAGE_QUOTA', { requestId: 'r-q' });
+    const payload = await waitForMessage(inbound, 'APP_STORAGE_QUOTA_RESULT');
+    expect(payload).toMatchObject({
+      requestId: 'r-q',
+      usedBytes: 12,
+      rowCount: 3,
+      limitBytes: 50_000_000,
+      limitRows: 1000,
+    });
+    const call = fetchMock.mock.calls.find((c) => String(c[0]).includes('apps.storage.getQuota'))!;
+    expect((call[1] as RequestInit).method).toBe('GET');
+    expect(decodeInputParam(String(call[0]))).toEqual({ json: { blockToken: TOKEN } });
+  });
+
+  it('a storage error (FORBIDDEN) maps to the error-shape reply (no hang)', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('apps.storage.get')) {
+        return trpcErr('storage get requires the apps:storage:read scope', 403);
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('APP_STORAGE_GET', { requestId: 'r-forbidden', key: 'k' });
+    const payload = await waitForMessage(inbound, 'APP_STORAGE_GET_RESULT');
+    expect(payload.requestId).toBe('r-forbidden');
+    expect(payload.value).toBeNull();
+    expect(payload.error).toMatch(/apps:storage:read/);
+  });
+});
+
+describe('createLiveHost — SET_USER_CHECKPOINT (forwarded to blocks.updateUserSettings)', () => {
+  let uninstall: (() => void) | undefined;
+  let inbound: ReturnType<typeof collectInbound>;
+  let fetchMock: ReturnType<typeof vi.fn>;
+  const TOKEN = fakeJwt(DEFAULT_CLAIMS);
+
+  function installWithFetch(impl: (url: string, init?: RequestInit) => Promise<Response>) {
+    fetchMock = vi.fn(impl);
+    const host = createLiveHost({
+      blockToken: TOKEN,
+      viewer: { id: 42, username: 'dev-mod' },
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+    uninstall = host.install();
+  }
+
+  beforeEach(() => {
+    inbound = collectInbound();
+  });
+  afterEach(() => {
+    uninstall?.();
+    uninstall = undefined;
+    inbound.stop();
+    vi.restoreAllMocks();
+  });
+
+  it('forwards a numeric versionId to blocks.updateUserSettings → ok:true', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('blocks.updateUserSettings')) return trpcData({ ok: true });
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('SET_USER_CHECKPOINT', { requestId: 'r-suc', versionId: 9001 });
+    const payload = await waitForMessage(inbound, 'USER_CHECKPOINT_SET');
+    expect(payload.requestId).toBe('r-suc');
+    expect(payload.ok).toBe(true);
+    expect(payload.error).toBeUndefined();
+
+    const call = fetchMock.mock.calls.find((c) =>
+      String(c[0]).includes('blocks.updateUserSettings'),
+    )!;
+    expect((call[1] as RequestInit).method).toBe('POST');
+    expect(JSON.parse(String((call[1] as RequestInit).body))).toEqual({
+      json: { blockToken: TOKEN, settings: { checkpoint_version_id: 9001 } },
+    });
+  });
+
+  it('forwards an explicit null versionId (clear override) to the backend', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('blocks.updateUserSettings')) return trpcData({ ok: true });
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('SET_USER_CHECKPOINT', { requestId: 'r-null', versionId: null });
+    const payload = await waitForMessage(inbound, 'USER_CHECKPOINT_SET');
+    expect(payload.ok).toBe(true);
+    const call = fetchMock.mock.calls.find((c) =>
+      String(c[0]).includes('blocks.updateUserSettings'),
+    )!;
+    expect(JSON.parse(String((call[1] as RequestInit).body))).toEqual({
+      json: { blockToken: TOKEN, settings: { checkpoint_version_id: null } },
+    });
+  });
+
+  it('surfaces the REAL backend error (page token lacks modelId) as ok:false', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('blocks.updateUserSettings')) {
+        return trpcErr('block token lacks modelId context', 400);
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('SET_USER_CHECKPOINT', { requestId: 'r-page', versionId: 9001 });
+    const payload = await waitForMessage(inbound, 'USER_CHECKPOINT_SET');
+    expect(payload.ok).toBe(false);
+    expect(payload.error).toMatch(/lacks modelId context/);
+  });
+
+  it('an invalid versionId is rejected WITHOUT a backend call', async () => {
+    installWithFetch(async (url) => {
+      throw new Error(`should not have fetched ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('SET_USER_CHECKPOINT', { requestId: 'r-bad', versionId: 'not-a-number' });
+    const payload = await waitForMessage(inbound, 'USER_CHECKPOINT_SET');
+    expect(payload.ok).toBe(false);
+    expect(payload.error).toMatch(/versionId must be a number or null/);
+    // No updateUserSettings call was made.
+    const called = fetchMock.mock.calls.some((c) =>
+      String(c[0]).includes('blocks.updateUserSettings'),
+    );
+    expect(called).toBe(false);
+  });
+});
+
+describe('createLiveHost — GET_BUZZ_BALANCE (served via blocks.getMyBuzzBalance)', () => {
+  let uninstall: (() => void) | undefined;
+  let inbound: ReturnType<typeof collectInbound>;
+  let fetchMock: ReturnType<typeof vi.fn>;
+  const TOKEN = fakeJwt(DEFAULT_CLAIMS);
+
+  function installWithFetch(impl: (url: string, init?: RequestInit) => Promise<Response>) {
+    fetchMock = vi.fn(impl);
+    const host = createLiveHost({
+      blockToken: TOKEN,
+      viewer: { id: 42, username: 'dev-mod' }, // skip /blocks/me
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+    uninstall = host.install();
+  }
+
+  beforeEach(() => {
+    inbound = collectInbound();
+  });
+  afterEach(() => {
+    uninstall?.();
+    uninstall = undefined;
+    inbound.stop();
+    vi.restoreAllMocks();
+  });
+
+  it('GET_BUZZ_BALANCE → blocks.getMyBuzzBalance (POST body) → balance', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('blocks.getMyBuzzBalance')) {
+        return trpcData({ blue: 100, green: 20, yellow: 3 });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('GET_BUZZ_BALANCE', { requestId: 'r-bal' });
+    const payload = await waitForMessage(inbound, 'BUZZ_BALANCE_RESULT');
+    expect(payload.requestId).toBe('r-bal');
+    expect(payload.balance).toEqual({ blue: 100, green: 20, yellow: 3 });
+    expect(payload.error).toBeUndefined();
+
+    const call = fetchMock.mock.calls.find((c) =>
+      String(c[0]).includes('blocks.getMyBuzzBalance'),
+    )!;
+    // MUTATION → POST, token-bound in the body (never the URL).
+    expect((call[1] as RequestInit).method).toBe('POST');
+    expect(String(call[0])).toBe('https://civitai.com/api/trpc/blocks.getMyBuzzBalance');
+    expect((call[1] as RequestInit).headers).toMatchObject({ authorization: `Bearer ${TOKEN}` });
+    expect(JSON.parse(String((call[1] as RequestInit).body))).toEqual({
+      json: { blockToken: TOKEN },
+    });
+  });
+
+  it('a backend error maps to the error-shape reply (no hang)', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('blocks.getMyBuzzBalance')) {
+        return trpcErr('buzz balance unavailable for an anonymous viewer', 401);
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('GET_BUZZ_BALANCE', { requestId: 'r-bal-err' });
+    const payload = await waitForMessage(inbound, 'BUZZ_BALANCE_RESULT');
+    expect(payload.requestId).toBe('r-bal-err');
+    expect(payload.balance).toBeUndefined();
+    expect(payload.error).toMatch(/anonymous viewer/);
+  });
+
+  it('a request without a requestId is dropped WITHOUT a backend call', async () => {
+    installWithFetch(async (url) => {
+      throw new Error(`should not have fetched ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('GET_BUZZ_BALANCE', {});
+    // Give the host a tick to (not) reply, then assert nothing was dispatched
+    // and no balance call was made.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(inbound.messages.some((m) => m.type === 'BUZZ_BALANCE_RESULT')).toBe(false);
+    const called = fetchMock.mock.calls.some((c) =>
+      String(c[0]).includes('blocks.getMyBuzzBalance'),
+    );
+    expect(called).toBe(false);
+  });
+});
+
+describe('createLiveHost — NAVIGATE', () => {
+  let uninstall: (() => void) | undefined;
+  let inbound: ReturnType<typeof collectInbound>;
+  let openSpy: ReturnType<typeof vi.spyOn>;
+  let assignSpy: ReturnType<typeof vi.spyOn>;
+  let pushSpy: ReturnType<typeof vi.spyOn>;
+  const TOKEN = fakeJwt(DEFAULT_CLAIMS);
+
+  function install() {
+    const host = createLiveHost({
+      blockToken: TOKEN,
+      viewer: { id: 42, username: 'dev-mod' }, // skip /blocks/me
+      fetchImpl: vi.fn(async () =>
+        trpcOk({ workflowId: 'x', status: 'pending' }),
+      ) as unknown as typeof fetch,
+    });
+    uninstall = host.install();
+  }
+
+  beforeEach(() => {
+    inbound = collectInbound();
+    openSpy = vi.spyOn(window, 'open').mockImplementation(() => null);
+    assignSpy = vi.spyOn(window.location, 'assign').mockImplementation(() => {});
+    // NOT mocked away — this spy only RECORDS, and calling through is
+    // load-bearing: the dev host's `reflectRoute` sits INSIDE the same `try` as
+    // `pushState`, so a stub that threw would skip the emit and the
+    // ROUTE_CHANGED tests below would fail for a reason that is not theirs.
+    // `vi.restoreAllMocks()` in `afterEach` puts it back; the URL itself is
+    // per-test-file in jsdom.
+    pushSpy = vi.spyOn(window.history, 'pushState');
+  });
+  afterEach(() => {
+    uninstall?.();
+    uninstall = undefined;
+    inbound.stop();
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * 🔴 THE WHOLE POINT OF THIS BLOCK. Before the `scope` contract this harness
+   * resolved EVERY path against the backend origin, so `dev:live` reached the
+   * real site where production resolved the same call under the block's own
+   * route. Every test below that names `pushSpy` is asserting the DEFAULT — an
+   * unscoped path must NOT leave the dev origin — which is the divergence that
+   * made a platform bug look like a block bug (civitai#5209).
+   */
+  // [invariant guard — green at base] It coincides at base for a REASON worth
+  // stating: site scope is what the old unconditional behaviour already did for a
+  // leading-slash path, so this passes before and after. Its value is asserting
+  // that the site half survived the split, not that it was added — the sibling
+  // `pushSpy` assertion is what makes the DEFAULT observable, and that one is red
+  // at base. The leading-slash test two below is the site-scope case that moved.
+  it('site scope assigns the resolved URL on the backend origin', async () => {
+    install();
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('NAVIGATE', { path: '/models/123', scope: 'site', target: 'current' });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(assignSpy).toHaveBeenCalledWith('https://civitai.com/models/123');
+    expect(pushSpy).not.toHaveBeenCalled();
+  });
+
+  // [invariant guard — green at base] Same coincidence as above, in the new_tab arm.
+  it('site scope + new_tab opens the backend-origin URL in a new tab', async () => {
+    install();
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('NAVIGATE', { path: '/models/123', scope: 'site', target: 'new_tab' });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(openSpy).toHaveBeenCalledWith('https://civitai.com/models/123', '_blank');
+    expect(assignSpy).not.toHaveBeenCalled();
+  });
+
+  it('site scope normalises a leading slash away rather than doubling it', async () => {
+    install();
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('NAVIGATE', { path: 'user/alice', scope: 'site' });
+    await new Promise((r) => setTimeout(r, 10));
+    // Byte-identical to the `/user/alice` spelling — one request, two spellings.
+    expect(assignSpy).toHaveBeenCalledWith('https://civitai.com/user/alice');
+  });
+
+  it('DEFAULT (no scope) stays on the dev origin and pushes, never touching the site', async () => {
+    install();
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('NAVIGATE', { path: '/models/123' });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(pushSpy).toHaveBeenCalledWith(null, '', `${ORIGIN}/models/123`);
+    expect(assignSpy).not.toHaveBeenCalled();
+    expect(openSpy).not.toHaveBeenCalled();
+  });
+
+  /**
+   * 🔴 THE ONE SAMPLE THAT IS WORTH TAKING OF THE NON-`'site'` ARM. The resolver
+   * is `payload.scope === 'site' ? 'site' : 'app'`, so ABSENT, `'app'` and
+   * `'universe'` are one code path — and the test above already pins the absent
+   * spelling. A third sample (`scope: 'app'`) was deleted rather than kept: it
+   * asserted nothing the two arms do not, while reading as extra coverage. This
+   * one earns its place by naming the FAIL-CLOSED property, which is the half a
+   * reader can get wrong.
+   */
+  it('an UNKNOWN scope fails CLOSED onto app, like the host', async () => {
+    install();
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('NAVIGATE', { path: 'models/123', scope: 'universe' });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(pushSpy).toHaveBeenCalledWith(null, '', `${ORIGIN}/models/123`);
+    expect(assignSpy).not.toHaveBeenCalled();
+  });
+
+  /**
+   * 🔴 THIS REPLACES A TEST THAT PINNED A SYNTHETIC `popstate`. It read "an
+   * app-scoped push fires popstate, so a router re-renders instead of only the
+   * URL moving" and asserted `new PopStateEvent('popstate')` had been
+   * dispatched after `pushState`. That made a history router re-render in
+   * `dev:live` AND NOWHERE ELSE: no production host dispatches a `popstate` for
+   * its own shallow push — it sends `ROUTE_CHANGED`, which the SDK now models.
+   * A dev harness kinder than production is how civitai#5209 stayed invisible,
+   * so the old assertion was pinning the bug's mirror image.
+   *
+   * At the WIRE here; the block-side half of the round trip (the message
+   * reaching `useCivitaiRoute`) is `useCivitaiRoute.test.tsx`'s SEAM block.
+   */
+  it('an app-scoped push REFLECTS the new sub-path over ROUTE_CHANGED', async () => {
+    install();
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('NAVIGATE', { path: 'detail/7' });
+    const msg = await waitForMessage(inbound, 'ROUTE_CHANGED');
+    // No leading slash: the sub-path BELOW the app root, matching the
+    // `PageSlotContext.subPath` field it updates.
+    expect(msg).toEqual({ subPath: 'detail/7' });
+    expect(pushSpy).toHaveBeenCalledWith(null, '', `${ORIGIN}/detail/7`);
+  });
+
+  it('does NOT dispatch a popstate — that channel was the divergence', async () => {
+    // The negative half, stated separately so it cannot be lost in a later
+    // edit: re-adding the synthetic event would make `dev:live` deliver BOTH
+    // signals where production delivers one.
+    install();
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    const seen: string[] = [];
+    const onPop = () => seen.push(window.location.pathname);
+    window.addEventListener('popstate', onPop);
+    try {
+      post('NAVIGATE', { path: 'detail/7' });
+      await waitForMessage(inbound, 'ROUTE_CHANGED');
+      await new Promise((r) => setTimeout(r, 10));
+    } finally {
+      window.removeEventListener('popstate', onPop);
+    }
+    expect(seen).toEqual([]);
+  });
+
+  it('emits NOTHING for a route already showing — the host\'s effect is change-keyed', async () => {
+    install();
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('NAVIGATE', { path: 'detail/7' });
+    await waitForMessage(inbound, 'ROUTE_CHANGED');
+    const after = inbound.messages.filter((m) => m.type === 'ROUTE_CHANGED').length;
+    post('NAVIGATE', { path: '/detail/7' }); // the same route, spelled with a slash
+    await new Promise((r) => setTimeout(r, 20));
+    expect(inbound.messages.filter((m) => m.type === 'ROUTE_CHANGED')).toHaveLength(after);
+  });
+
+  // [invariant guard — green at base] It coincides because at base NOTHING ever
+  // emitted `ROUTE_CHANGED`, so "no ROUTE_CHANGED here" was true of every path.
+  // Its value is forward-facing: the emit added above has three gates, and this
+  // is the only check that the two NEGATIVE ones survive — a `reflectRoute` call
+  // moved out of the `current` arm, or up above the scope split, passes every
+  // other test in this file.
+  it('does NOT reflect a route the block was never shown: site scope and new_tab', async () => {
+    install();
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('NAVIGATE', { path: 'models/123', scope: 'site' });
+    post('NAVIGATE', { path: 'detail/7', target: 'new_tab' });
+    await new Promise((r) => setTimeout(r, 20));
+    // Site scope leaves the app; a new tab is a different frame. Neither moves
+    // the sub-path of the page this host is rendering.
+    expect(inbound.messages.some((m) => m.type === 'ROUTE_CHANGED')).toBe(false);
+  });
+
+  it('does NOT reflect the sub-path BLOCK_INIT already carried', async () => {
+    // The real host's effect is gated on `initSentRef` AND keyed on `[subPath]`,
+    // so it never restates the value init delivered. A harness that pushed one
+    // anyway would teach a block to expect a message it will not get.
+    uninstall?.();
+    const host = createLiveHost({
+      blockToken: TOKEN,
+      viewer: { id: 42, username: 'dev-mod' },
+      context: {
+        slotId: 'app.page',
+        entityType: 'none',
+        slug: 'seed-explorer',
+        subPath: 'compare/42',
+        viewerUserId: 42,
+      },
+    });
+    uninstall = host.install();
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('NAVIGATE', { path: 'compare/42' });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(inbound.messages.some((m) => m.type === 'ROUTE_CHANGED')).toBe(false);
+    // …and a DIFFERENT route still reflects, so the seed is a seed and not a mute.
+    post('NAVIGATE', { path: 'detail/7' });
+    const msg = await waitForMessage(inbound, 'ROUTE_CHANGED');
+    expect(msg).toEqual({ subPath: 'detail/7' });
+  });
+
+  it('app scope + new_tab opens the DEV origin, not the site', async () => {
+    install();
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('NAVIGATE', { path: 'detail/7', target: 'new_tab' });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(openSpy).toHaveBeenCalledWith(`${ORIGIN}/detail/7`, '_blank');
+  });
+
+  /**
+   * ⚠️ THIS REPLACES A TEST THAT ASSERTED THE OPPOSITE. It read "passes an
+   * absolute URL through unchanged" and pinned `win.open('https://example.com/x')`
+   * — a second `dev:live`-vs-production divergence in the same handler, since the
+   * host refuses ANY scheme in either scope. The old behaviour was the bug.
+   */
+  it('DROPS an absolute URL — the host refuses any scheme, in either scope', async () => {
+    install();
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('NAVIGATE', { path: 'https://example.com/x', target: 'new_tab' });
+    post('NAVIGATE', { path: 'javascript:alert(1)', scope: 'site' });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(openSpy).not.toHaveBeenCalled();
+    expect(assignSpy).not.toHaveBeenCalled();
+    expect(pushSpy).not.toHaveBeenCalled();
+  });
+
+  it('DROPS a protocol-relative path rather than reading it as a redundant slash', async () => {
+    install();
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('NAVIGATE', { path: '//evil.example/x', scope: 'site' });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(assignSpy).not.toHaveBeenCalled();
+    expect(openSpy).not.toHaveBeenCalled();
+    expect(pushSpy).not.toHaveBeenCalled();
+  });
+
+  it('DROPS an `/api/*` first segment in SITE scope, and allows it in app scope', async () => {
+    install();
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('NAVIGATE', { path: '/api/auth/logout', scope: 'site' });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(assignSpy).not.toHaveBeenCalled();
+    // App scope is untouched: it resolves under the dev origin and reaches no
+    // site handler, exactly as the host's own note says.
+    post('NAVIGATE', { path: 'api/thing' });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(pushSpy).toHaveBeenCalledWith(null, '', `${ORIGIN}/api/thing`);
+  });
+
+  /**
+   * 🔴 BY DECODED VALUE, LIKE THE HOST. The refusal above used to compare the
+   * raw first segment, so `%61pi/auth/logout` — refused in production, where
+   * `navigateSiteFirstSegmentIsRefused` decodes before comparing — was FOLLOWED
+   * here. A mirror of a published refusal that is wrong for one input shape is
+   * worse than either having it or not, which is why the branch was fixed rather
+   * than deleted.
+   */
+  it('DROPS a percent-encoded `api` first segment in site scope', async () => {
+    install();
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('NAVIGATE', { path: '%61pi/auth/logout', scope: 'site' });
+    post('NAVIGATE', { path: 'AP%49/auth/logout', scope: 'site' });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(assignSpy).not.toHaveBeenCalled();
+    expect(openSpy).not.toHaveBeenCalled();
+  });
+
+  it('DROPS a first segment it cannot DECODE — fail closed, like the host', async () => {
+    // The host's second refusal channel: a segment whose meaning cannot be
+    // established is not pushed. An undecodable segment is not evidence that it
+    // is not `api`.
+    install();
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('NAVIGATE', { path: '%zz/auth/logout', scope: 'site' });
+    post('NAVIGATE', { path: '%/x', scope: 'site' });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(assignSpy).not.toHaveBeenCalled();
+  });
+
+  // [invariant guard — green at base] It coincides because the base compared the
+  // RAW segment, which also allowed this path — it is red only against the
+  // over-correction, not against the bug. That is exactly its job: it is the
+  // POSITIVE control for the two decode tests above, which a refusal that simply
+  // dropped every percent sign would also satisfy.
+  it('still allows a segment that merely CONTAINS a percent — the decode is not a ban', async () => {
+    // A positive control on the same branch: without it, a refusal that dropped
+    // every percent sign would pass both tests above while breaking a legitimate
+    // path, and the two negatives could not tell the difference.
+    install();
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('NAVIGATE', { path: '50%25-off/x', scope: 'site' });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(assignSpy).toHaveBeenCalledWith('https://civitai.com/50%25-off/x');
+  });
+});
+
+describe('createLiveHost — startup guards', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('logs an actionable console.error when no block token is supplied', () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    // Non-fatal: the host is still returned so the dev sees a clear error.
+    const host = createLiveHost({ blockToken: '' });
+    expect(host).toBeDefined();
+    expect(typeof host.install).toBe('function');
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('No block token supplied'));
+  });
+});
+
+describe('createLiveHost — SHARED storage (served via apps.shared.*)', () => {
+  let uninstall: (() => void) | undefined;
+  let inbound: ReturnType<typeof collectInbound>;
+  let fetchMock: ReturnType<typeof vi.fn>;
+  const TOKEN = fakeJwt(DEFAULT_CLAIMS);
+
+  function installWithFetch(impl: (url: string, init?: RequestInit) => Promise<Response>) {
+    fetchMock = vi.fn(impl);
+    const host = createLiveHost({
+      blockToken: TOKEN,
+      viewer: { id: 42, username: 'dev-mod' }, // skip /blocks/me
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+    uninstall = host.install();
+  }
+
+  beforeEach(() => {
+    inbound = collectInbound();
+  });
+  afterEach(() => {
+    uninstall?.();
+    uninstall = undefined;
+    inbound.stop();
+    vi.restoreAllMocks();
+  });
+
+  it('SHARED_LIST → apps.shared.list (GET) → items with ISO dates', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('apps.shared.list')) {
+        return trpcData({
+          items: [
+            {
+              key: 'req:1',
+              authorUserId: 7,
+              value: { title: 'Dark mode', body: 'please' },
+              count: 3,
+              createdAt: '2026-05-01T00:00:00.000Z',
+              updatedAt: '2026-05-02T00:00:00.000Z',
+            },
+          ],
+          nextCursor: 'bmV4dA==',
+        });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('SHARED_LIST', { requestId: 'r-l', prefix: 'req:', limit: 5 });
+    const payload = await waitForMessage(inbound, 'SHARED_LIST_RESULT');
+    expect(payload.requestId).toBe('r-l');
+    const items = payload.items as Array<Record<string, unknown>>;
+    expect(items[0].key).toBe('req:1');
+    expect(items[0].count).toBe(3);
+    expect(items[0].createdAt).toBe('2026-05-01T00:00:00.000Z');
+    expect(payload.nextCursor).toBe('bmV4dA==');
+
+    const call = fetchMock.mock.calls.find((c) => String(c[0]).includes('apps.shared.list'))!;
+    expect((call[1] as RequestInit).method).toBe('GET');
+    expect(decodeInputParam(String(call[0]))).toEqual({
+      json: { blockToken: TOKEN, limit: 5, prefix: 'req:' },
+    });
+  });
+
+  it('SHARED_GET_COUNT → apps.shared.getCount (GET) → count', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('apps.shared.getCount')) return trpcData({ count: 42 });
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('SHARED_GET_COUNT', { requestId: 'r-c', key: 'req:1' });
+    const payload = await waitForMessage(inbound, 'SHARED_GET_COUNT_RESULT');
+    expect(payload.count).toBe(42);
+  });
+
+  it('SHARED_GET_COUNTS → apps.shared.getCounts (GET) → counts map', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('apps.shared.getCounts')) return trpcData({ counts: { a: 1, b: 0 } });
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('SHARED_GET_COUNTS', { requestId: 'r-cs', keys: ['a', 'b'] });
+    const payload = await waitForMessage(inbound, 'SHARED_GET_COUNTS_RESULT');
+    expect(payload.counts).toEqual({ a: 1, b: 0 });
+  });
+
+  it('SHARED_APPEND → apps.shared.append (POST) → key', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('apps.shared.append')) return trpcData({ key: 'shared_9' });
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('SHARED_APPEND', { requestId: 'r-a', value: { title: 't' } });
+    const payload = await waitForMessage(inbound, 'SHARED_APPEND_RESULT');
+    expect(payload.key).toBe('shared_9');
+    const call = fetchMock.mock.calls.find((c) => String(c[0]).includes('apps.shared.append'))!;
+    expect((call[1] as RequestInit).method).toBe('POST');
+    expect(JSON.parse(String((call[1] as RequestInit).body))).toEqual({
+      json: { blockToken: TOKEN, value: { title: 't' } },
+    });
+  });
+
+  it('SHARED_VOTE → apps.shared.vote (POST) → count', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('apps.shared.vote')) return trpcData({ count: 5 });
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('SHARED_VOTE', { requestId: 'r-v', key: 'req:1' });
+    const payload = await waitForMessage(inbound, 'SHARED_VOTE_RESULT');
+    expect(payload.count).toBe(5);
+  });
+
+  it('SHARED_UNVOTE → apps.shared.unvote (POST) → count', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('apps.shared.unvote')) return trpcData({ count: 4 });
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('SHARED_UNVOTE', { requestId: 'r-uv', key: 'req:1' });
+    const payload = await waitForMessage(inbound, 'SHARED_UNVOTE_RESULT');
+    expect(payload.count).toBe(4);
+  });
+
+  it('SHARED_UPDATE → apps.shared.update (POST) → ok', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('apps.shared.update')) return trpcData({ ok: true });
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('SHARED_UPDATE', { requestId: 'r-u', key: 'req:1', value: { title: 't2' } });
+    const payload = await waitForMessage(inbound, 'SHARED_UPDATE_RESULT');
+    expect(payload.ok).toBe(true);
+  });
+
+  it('SHARED_WITHDRAW → apps.shared.withdraw (POST) → ok + deleted', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('apps.shared.withdraw')) return trpcData({ ok: true, deleted: true });
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('SHARED_WITHDRAW', { requestId: 'r-w', key: 'req:1' });
+    const payload = await waitForMessage(inbound, 'SHARED_WITHDRAW_RESULT');
+    expect(payload.ok).toBe(true);
+    expect(payload.deleted).toBe(true);
+  });
+
+  it('SHARED_VOTE backend error → error reply (never hangs)', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('apps.shared.vote')) return trpcErr('FORBIDDEN', 403);
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('SHARED_VOTE', { requestId: 'r-ve', key: 'req:1' });
+    const payload = await waitForMessage(inbound, 'SHARED_VOTE_RESULT');
+    expect(payload.error).toBe('FORBIDDEN');
+    expect(payload.count).toBe(0);
+  });
+
+  // ── #386 ────────────────────────────────────────────────────────────────
+  // SHARED_GET and SHARED_REPORT had NO case in liveHost at all. They fell
+  // through the switch's `default: return` with no reply, so every one of the
+  // assertions below timed out instead of failing: the block sat for the full
+  // 30s protocol timeout and then threw a generic RequestTimeoutError, while
+  // the identical call resolved under dev:mock.
+  it('SHARED_GET → apps.shared.get (GET) → the row, ISO-normalized (#386)', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('apps.shared.get?') || url.includes('apps.shared.get&')) {
+        return trpcData({
+          item: {
+            key: 'req:1',
+            authorUserId: 7,
+            value: { title: 'Dark mode' },
+            count: 3,
+            createdAt: '2026-05-01T00:00:00.000Z',
+            updatedAt: '2026-05-02T00:00:00.000Z',
+            viewerVoted: true,
+          },
+        });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('SHARED_GET', { requestId: 'r-g', key: 'req:1' });
+    const payload = await waitForMessage(inbound, 'SHARED_GET_RESULT');
+    expect(payload.requestId).toBe('r-g');
+    expect(payload.error).toBeUndefined();
+    const item = payload.item as Record<string, unknown>;
+    expect(item.key).toBe('req:1');
+    expect(item.count).toBe(3);
+    expect(item.createdAt).toBe('2026-05-01T00:00:00.000Z');
+    // The field that exists so a `?g=` deep-link can hydrate its vote button
+    // instead of guessing — forwarded, not dropped.
+    expect(item.viewerVoted).toBe(true);
+
+    const call = fetchMock.mock.calls.find((c) => String(c[0]).includes('apps.shared.get'))!;
+    expect((call[1] as RequestInit).method).toBe('GET');
+    expect(decodeInputParam(String(call[0]))).toEqual({
+      json: { blockToken: TOKEN, key: 'req:1' },
+    });
+  });
+
+  it('SHARED_GET on a missing/hidden row → item: null and NO error (#386)', async () => {
+    // A miss must resolve cleanly to "not found" rather than erroring — that is
+    // what stops a deep-link to a withdrawn or moderated row from leaking the
+    // difference between "hidden from you" and "does not exist".
+    installWithFetch(async (url) => {
+      if (url.includes('apps.shared.get')) return trpcData({ item: null });
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('SHARED_GET', { requestId: 'r-gm', key: 'gone' });
+    const payload = await waitForMessage(inbound, 'SHARED_GET_RESULT');
+    expect(payload.item).toBeNull();
+    expect(payload.error).toBeUndefined();
+  });
+
+  it('SHARED_GET accepts a BARE row as well as an `{ item }` envelope (#386)', async () => {
+    // The sibling reads disagree about envelopes (`getCount` → `{ count }`,
+    // `withdraw` → bare `{ deleted }`), so an envelope guess that was wrong
+    // would turn every hit into a silent `item: null` — "the row does not
+    // exist" for a row that does. Both shapes resolve to the same item.
+    installWithFetch(async (url) => {
+      if (url.includes('apps.shared.get')) {
+        return trpcData({
+          key: 'req:2',
+          authorUserId: 9,
+          value: { title: 'bare' },
+          count: 1,
+          createdAt: '2026-05-03T00:00:00.000Z',
+          updatedAt: '2026-05-03T00:00:00.000Z',
+        });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('SHARED_GET', { requestId: 'r-gb', key: 'req:2' });
+    const payload = await waitForMessage(inbound, 'SHARED_GET_RESULT');
+    const item = payload.item as Record<string, unknown>;
+    expect(item.key).toBe('req:2');
+    expect(item.authorUserId).toBe(9);
+    expect(item.count).toBe(1);
+  });
+
+  it('SHARED_LIST forwards a server-sent viewerVoted, and omits it otherwise (#386)', async () => {
+    // The row mapper is now ONE function shared with SHARED_GET. That
+    // consolidation is what carries `viewerVoted` onto the list path too —
+    // additive and optional, so a host that predates the field is unchanged.
+    installWithFetch(async (url) => {
+      if (url.includes('apps.shared.list')) {
+        return trpcData({
+          items: [
+            { key: 'a', authorUserId: 1, value: {}, count: 0, createdAt: 'x', updatedAt: 'y', viewerVoted: true },
+            { key: 'b', authorUserId: 2, value: {}, count: 0, createdAt: 'x', updatedAt: 'y' },
+          ],
+          nextCursor: null,
+        });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('SHARED_LIST', { requestId: 'r-lv', limit: 5 });
+    const payload = await waitForMessage(inbound, 'SHARED_LIST_RESULT');
+    const items = payload.items as Array<Record<string, unknown>>;
+    expect(items[0].viewerVoted).toBe(true);
+    expect('viewerVoted' in items[1]).toBe(false);
+  });
+
+  it('SHARED_GET backend error → error reply (never hangs) (#386)', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('apps.shared.get')) return trpcErr('FORBIDDEN', 403);
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('SHARED_GET', { requestId: 'r-ge', key: 'req:1' });
+    const payload = await waitForMessage(inbound, 'SHARED_GET_RESULT');
+    expect(payload.error).toBe('FORBIDDEN');
+    expect(payload.item).toBeNull();
+  });
+
+  it('SHARED_REPORT → apps.shared.report (POST) → ok, forwarding `reason` (#386)', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('apps.shared.report')) return trpcData({ ok: true });
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('SHARED_REPORT', { requestId: 'r-rep', key: 'req:1', reason: 'spam' });
+    const payload = await waitForMessage(inbound, 'SHARED_REPORT_RESULT');
+    expect(payload.requestId).toBe('r-rep');
+    expect(payload.ok).toBe(true);
+    expect(payload.error).toBeUndefined();
+
+    const call = fetchMock.mock.calls.find((c) => String(c[0]).includes('apps.shared.report'))!;
+    expect((call[1] as RequestInit).method).toBe('POST');
+    expect(JSON.parse(String((call[1] as RequestInit).body))).toEqual({
+      json: { blockToken: TOKEN, key: 'req:1', reason: 'spam' },
+    });
+  });
+
+  it('SHARED_REPORT without a reason omits the field entirely (#386)', async () => {
+    // Not `reason: ''`. The field is optional free text; sending an empty
+    // string is a different input from sending none, and the server bounds it.
+    installWithFetch(async (url) => {
+      if (url.includes('apps.shared.report')) return trpcData({ ok: true });
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('SHARED_REPORT', { requestId: 'r-rep2', key: 'req:1' });
+    await waitForMessage(inbound, 'SHARED_REPORT_RESULT');
+    const call = fetchMock.mock.calls.find((c) => String(c[0]).includes('apps.shared.report'))!;
+    expect(JSON.parse(String((call[1] as RequestInit).body))).toEqual({
+      json: { blockToken: TOKEN, key: 'req:1' },
+    });
+  });
+
+  it('SHARED_REPORT backend error → ok:false + error (never hangs) (#386)', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('apps.shared.report')) return trpcErr('NOT_FOUND', 404);
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('SHARED_REPORT', { requestId: 'r-repe', key: 'nope' });
+    const payload = await waitForMessage(inbound, 'SHARED_REPORT_RESULT');
+    expect(payload.ok).toBe(false);
+    expect(payload.error).toBe('NOT_FOUND');
+  });
+});
+
+describe('createLiveHost — SAVE_IMAGE (refused, honest-by-design) (#386)', () => {
+  let uninstall: (() => void) | undefined;
+  let inbound: ReturnType<typeof collectInbound>;
+
+  beforeEach(() => {
+    inbound = collectInbound();
+  });
+  afterEach(() => {
+    uninstall?.();
+    uninstall = undefined;
+    inbound.stop();
+    vi.restoreAllMocks();
+  });
+
+  function install() {
+    const host = createLiveHost({
+      blockToken: fakeJwt(DEFAULT_CLAIMS),
+      viewer: { id: 42, username: 'dev' },
+      fetchImpl: vi.fn(async () => {
+        throw new Error('SAVE_IMAGE must not touch the network');
+      }) as unknown as typeof fetch,
+    });
+    uninstall = host.install();
+  }
+
+  // Before #386, SAVE_IMAGE had no case at all: it fell through `default:
+  // return` and `useSaveImage().saveImage(...)` hung for 30s before throwing a
+  // generic RequestTimeoutError. The refusal is IMMEDIATE and names the
+  // harness, so the dev learns what to do instead.
+  it('replies ok:false with an actionable error instead of hanging', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    install();
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('SAVE_IMAGE', { requestId: 'r-save', url: 'https://image.civitai.com/x.jpeg' });
+    const payload = await waitForMessage(inbound, 'SAVE_IMAGE_RESULT');
+
+    expect(payload.requestId).toBe('r-save');
+    expect(payload.ok).toBe(false);
+    // A PRESENT error is the reject signal — presence, not truthiness — so it
+    // must be a non-empty string, and it must point at dev:mock.
+    expect(typeof payload.error).toBe('string');
+    expect(String(payload.error).length).toBeGreaterThan(0);
+    expect(String(payload.error)).toMatch(/dev:mock/);
+
+    // …and the console warning fired once, naming the capability.
+    expect(warnSpy.mock.calls.map((c) => String(c[0])).join('\n')).toMatch(/SAVE_IMAGE/);
+  });
+
+  it('refuses the imageId variant too — neither gate exists in this harness', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    install();
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    post('SAVE_IMAGE', { requestId: 'r-save-id', imageId: 12345 });
+    const payload = await waitForMessage(inbound, 'SAVE_IMAGE_RESULT');
+    expect(payload.ok).toBe(false);
+    expect(String(payload.error)).toMatch(/dev:mock/);
+  });
+});
+
+describe('createLiveHost — PUBLISH_GENERATION_OUTPUTS (refused: needs a signed-in session)', () => {
+  let uninstall: (() => void) | undefined;
+  let inbound: ReturnType<typeof collectInbound>;
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    inbound = collectInbound();
+  });
+  afterEach(() => {
+    uninstall?.();
+    uninstall = undefined;
+    inbound.stop();
+    vi.restoreAllMocks();
+  });
+
+  // Before this change the harness forwarded to `blocks.publishGenerationOutputs`
+  // with only the block token. Publishing requires the viewer's signed-in
+  // civitai.com session (same as CREATE_POST_FROM_APP), which this
+  // harness does not have — so it must refuse immediately, on the reply
+  // channel, without touching the network.
+  it('replies PUBLISH_RESULT with an actionable error and makes no network call', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    fetchMock = vi.fn(async () => {
+      throw new Error('PUBLISH_GENERATION_OUTPUTS must not touch the network');
+    });
+    const host = createLiveHost({
+      blockToken: fakeJwt(DEFAULT_CLAIMS),
+      viewer: { id: 42, username: 'dev' },
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+    uninstall = host.install();
+    await waitForMessage(inbound, 'BLOCK_INIT');
+    const callsAfterInit = fetchMock.mock.calls.length;
+
+    post('PUBLISH_GENERATION_OUTPUTS', {
+      requestId: 'r-pub',
+      workflowId: 'wf_1',
+      imageIndexes: [0],
+    });
+    const payload = await waitForMessage(inbound, 'PUBLISH_RESULT');
+
+    expect(payload.requestId).toBe('r-pub');
+    expect('result' in payload).toBe(false);
+    expect(payload.error).toBe(
+      "publishing generation outputs is not supported in dev:live — publishing requires the " +
+        "viewer's signed-in civitai.com session, which the local harness does not have; test " +
+        'publishing against the mock host — createMockHost or Harness from ' +
+        '@civitai/blocks-react/testing, with the publishImageIds / publishError options',
+    );
+    expect(fetchMock.mock.calls.length).toBe(callsAfterInit);
+    const urls = fetchMock.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(urls).not.toMatch(/publishGenerationOutputs/);
+
+    expect(warnSpy.mock.calls.map((c) => String(c[0])).join('\n')).toMatch(
+      /PUBLISH_GENERATION_OUTPUTS/,
+    );
+  });
+});
+
+describe('createLiveHost — training bridges (refused: the server refuses dev tokens)', () => {
+  let uninstall: (() => void) | undefined;
+  let inbound: ReturnType<typeof collectInbound>;
+
+  beforeEach(() => {
+    inbound = collectInbound();
+  });
+  afterEach(() => {
+    uninstall?.();
+    uninstall = undefined;
+    inbound.stop();
+    vi.restoreAllMocks();
+  });
+
+  // Every `kind: 'training'` procedure refuses a dev token server-side, and a run
+  // is confirmed in host chrome this harness does not have. Each bridge must
+  // refuse on ITS OWN reply channel, immediately, without a network call — a
+  // missing case would hang the hook to its bound (120s / 10 min).
+  for (const [type, replyType, payload] of [
+    [
+      'PREPARE_TRAINING_DATASET',
+      'TRAINING_DATASET_RESULT',
+      { items: [{ imageId: 1, caption: 'c' }] },
+    ],
+    ['RUN_TRAINING', 'TRAINING_RESULT', { body: { kind: 'training', quoteId: 'tq_x' } }],
+  ] as const) {
+    it(`${type} replies ${replyType} with a refusal and makes no network call`, async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const fetchMock = vi.fn(async () => {
+        throw new Error(`${type} must not touch the network`);
+      });
+      uninstall = createLiveHost({
+        blockToken: fakeJwt(DEFAULT_CLAIMS),
+        viewer: { id: 42, username: 'dev' },
+        fetchImpl: fetchMock as unknown as typeof fetch,
+      }).install();
+      await waitForMessage(inbound, 'BLOCK_INIT');
+      const callsAfterInit = fetchMock.mock.calls.length;
+
+      post(type, { requestId: `r-${type}`, ...payload });
+      const reply = await waitForMessage(inbound, replyType);
+
+      expect(reply.requestId).toBe(`r-${type}`);
+      expect(reply.error).toBe('training is not supported in dev:live — use dev:mock');
+      expect('result' in reply || 'snapshot' in reply).toBe(false);
+      expect(fetchMock.mock.calls.length).toBe(callsAfterInit);
+    });
+  }
+});
+
+describe('createLiveHost — OPEN_IMAGE_UPLOAD (no headless upload contract)', () => {
+  let uninstall: (() => void) | undefined;
+  let inbound: ReturnType<typeof collectInbound>;
+
+  beforeEach(() => {
+    inbound = collectInbound();
+  });
+  afterEach(() => {
+    uninstall?.();
+    uninstall = undefined;
+    inbound.stop();
+    vi.restoreAllMocks();
+  });
+
+  it('replies IMAGE_UPLOAD_RESULT dismissed (no `selected`) instead of hanging', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const host = createLiveHost({
+      blockToken: fakeJwt(DEFAULT_CLAIMS),
+      viewer: { id: 42, username: 'dev-mod' },
+      fetchImpl: (async () => {
+        throw new Error('no network expected for OPEN_IMAGE_UPLOAD');
+      }) as unknown as typeof fetch,
+    });
+    uninstall = host.install();
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('OPEN_IMAGE_UPLOAD', { requestId: 'r-img' });
+    const payload = await waitForMessage(inbound, 'IMAGE_UPLOAD_RESULT');
+    expect(payload.requestId).toBe('r-img');
+    // Dismissed: no `selected` → the hook resolves to null (no fabricated image).
+    expect('selected' in payload).toBe(false);
+    const logged = warn.mock.calls.map((c) => String(c[0]));
+    expect(logged.filter((m) => m.includes('resolving the upload as dismissed (null)'))).toHaveLength(1);
+    expect(logged.filter((m) => m.includes('uploadImageBytesResult'))).toHaveLength(0);
+  });
+
+  it('a `useUploadImageBytes()` upload rejects with the no-image error, never hangs', async () => {
+    // dev:live has no bytes branch: the `bytes` variant gets the same DISMISSED
+    // reply as the picker path, and the hook (which has no "dismissed" outcome)
+    // rejects with its own no-image error. Driven through the REAL transport and
+    // validator, so a dropped reply would surface as a hook that never settles
+    // (its own bound is the 10-minute human-interaction timeout, far past
+    // `waitFor`'s).
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    getTransport({ allowedParentOrigins: [ORIGIN] });
+    try {
+      const host = createLiveHost({
+        blockToken: fakeJwt(DEFAULT_CLAIMS),
+        viewer: { id: 42, username: 'dev-mod' },
+        fetchImpl: (async () => {
+          throw new Error('no network expected for OPEN_IMAGE_UPLOAD');
+        }) as unknown as typeof fetch,
+      });
+      uninstall = host.install();
+      await waitFor(() => expect(getTransport().getSnapshot().ready).toBe(true));
+
+      const { result } = renderHook(() => useUploadImageBytes());
+      const state: { value?: unknown; caught?: Error } = {};
+      void result.current
+        .upload(new Uint8Array([0x89, 0x50, 0x4e, 0x47]).buffer as ArrayBuffer)
+        .then((v) => (state.value = v))
+        .catch((e: Error) => (state.caught = e));
+
+      await waitFor(() => expect(state.caught?.message).toBe(UPLOAD_IMAGE_BYTES_NO_IMAGE_ERROR));
+      expect(UPLOAD_IMAGE_BYTES_NO_IMAGE_ERROR).toBe('the host returned no uploaded image');
+      expect(state.value).toBeUndefined();
+      // The wire reply is the picker path's dismissed shape: no image, no error.
+      const reply = await waitForMessage(inbound, 'IMAGE_UPLOAD_RESULT');
+      expect('selected' in reply).toBe(false);
+      expect('error' in reply).toBe(false);
+      // The log says it REJECTS (not "dismissed (null)") and names the mock option.
+      const logged = warn.mock.calls.map((c) => String(c[0]));
+      expect(logged).toContain(
+        '[createLiveHost] OPEN_IMAGE_UPLOAD { bytes } received but live dev mode has no bytes upload path — ' +
+          'useUploadImageBytes().upload() REJECTS with "the host returned no uploaded image". ' +
+          'Test the bytes upload against the real site, or use ' +
+          'createMockHost({ uploadImageBytesResult }) in dev:mock.',
+      );
+      expect(logged.filter((m) => m.includes('dismissed (null)'))).toHaveLength(0);
+    } finally {
+      resetTransport();
+    }
+  });
+});
+
+describe('createLiveHost — app subqueue (served via blocks.queryAppWorkflows / cancelAppWorkflow)', () => {
+  let uninstall: (() => void) | undefined;
+  let inbound: ReturnType<typeof collectInbound>;
+  let fetchMock: ReturnType<typeof vi.fn>;
+  const TOKEN = fakeJwt(DEFAULT_CLAIMS);
+
+  const DONE = {
+    workflowId: 'wf_1',
+    status: 'succeeded',
+    images: [{ url: 'https://image.civitai.com/x/a.jpeg', width: 1024, height: 1024, nsfwLevel: 1 }],
+    cost: 12,
+    createdAt: '2026-07-14T12:00:00.000Z',
+  };
+
+  function installWithFetch(impl: (url: string, init?: RequestInit) => Promise<Response>) {
+    fetchMock = vi.fn(impl);
+    const host = createLiveHost({
+      blockToken: TOKEN,
+      viewer: { id: 42, username: 'dev-mod' }, // skip /blocks/me
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+    uninstall = host.install();
+  }
+
+  beforeEach(() => {
+    inbound = collectInbound();
+  });
+  afterEach(() => {
+    uninstall?.();
+    uninstall = undefined;
+    inbound.stop();
+    vi.restoreAllMocks();
+  });
+
+  it('QUERY_APP_WORKFLOWS → blocks.queryAppWorkflows (POST, params spread first, token last) → result', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('blocks.queryAppWorkflows')) {
+        return trpcData({ workflows: [DONE], cursor: 'next-abc' });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('QUERY_APP_WORKFLOWS', { requestId: 'r-q', params: { limit: 20, cursor: 'c0' } });
+    const payload = await waitForMessage(inbound, 'APP_WORKFLOWS_RESULT');
+    expect(payload.requestId).toBe('r-q');
+    expect(payload.result).toEqual({ workflows: [DONE], cursor: 'next-abc' });
+    expect(payload.error).toBeUndefined();
+
+    const call = fetchMock.mock.calls.find((c) => String(c[0]).includes('blocks.queryAppWorkflows'))!;
+    expect((call[1] as RequestInit).method).toBe('POST');
+    expect(String(call[0])).toBe('https://civitai.com/api/trpc/blocks.queryAppWorkflows');
+    expect((call[1] as RequestInit).headers).toMatchObject({ authorization: `Bearer ${TOKEN}` });
+    // params spread FIRST, blockToken LAST (non-overridable). No `tags` field.
+    expect(JSON.parse(String((call[1] as RequestInit).body))).toEqual({
+      json: { limit: 20, cursor: 'c0', blockToken: TOKEN },
+    });
+  });
+
+  it('CANCEL_APP_WORKFLOW → blocks.cancelAppWorkflow (POST { blockToken, workflowId }) → result', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('blocks.cancelAppWorkflow')) {
+        return trpcData({ workflow: { ...DONE, status: 'canceled' } });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('CANCEL_APP_WORKFLOW', { requestId: 'r-c', workflowId: 'wf_1' });
+    const payload = await waitForMessage(inbound, 'CANCEL_APP_WORKFLOW_RESULT');
+    expect(payload.requestId).toBe('r-c');
+    expect((payload.result as { workflow: { status: string } }).workflow.status).toBe('canceled');
+    expect(payload.error).toBeUndefined();
+
+    const call = fetchMock.mock.calls.find((c) => String(c[0]).includes('blocks.cancelAppWorkflow'))!;
+    expect((call[1] as RequestInit).method).toBe('POST');
+    expect(JSON.parse(String((call[1] as RequestInit).body))).toEqual({
+      json: { blockToken: TOKEN, workflowId: 'wf_1' },
+    });
+  });
+
+  it('a backend error maps to the error-shape reply (no hang) for both bridges', async () => {
+    installWithFetch(async (url) => {
+      if (url.includes('blocks.queryAppWorkflows')) return trpcErr('block lacks ai:write:budgeted scope', 403);
+      if (url.includes('blocks.cancelAppWorkflow')) return trpcErr('workflow is not in this app subqueue', 403);
+      throw new Error(`unexpected ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('QUERY_APP_WORKFLOWS', { requestId: 'r-qe' });
+    const qp = await waitForMessage(inbound, 'APP_WORKFLOWS_RESULT');
+    expect(qp.result).toBeUndefined();
+    expect(qp.error).toMatch(/ai:write:budgeted/);
+
+    post('CANCEL_APP_WORKFLOW', { requestId: 'r-ce', workflowId: 'wf_1' });
+    const cp = await waitForMessage(inbound, 'CANCEL_APP_WORKFLOW_RESULT');
+    expect(cp.result).toBeUndefined();
+    expect(cp.error).toMatch(/not in this app subqueue/);
+  });
+
+  it('a QUERY with no requestId is dropped WITHOUT a backend call', async () => {
+    installWithFetch(async (url) => {
+      throw new Error(`should not have fetched ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('QUERY_APP_WORKFLOWS', {});
+    await new Promise((r) => setTimeout(r, 50));
+    expect(inbound.messages.some((m) => m.type === 'APP_WORKFLOWS_RESULT')).toBe(false);
+    expect(fetchMock.mock.calls.some((c) => String(c[0]).includes('blocks.queryAppWorkflows'))).toBe(false);
+  });
+
+  it('a CANCEL with a missing/empty workflowId is dropped WITHOUT a backend call', async () => {
+    installWithFetch(async (url) => {
+      throw new Error(`should not have fetched ${url}`);
+    });
+    await waitForMessage(inbound, 'BLOCK_INIT');
+
+    post('CANCEL_APP_WORKFLOW', { requestId: 'r-c', workflowId: '' });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(inbound.messages.some((m) => m.type === 'CANCEL_APP_WORKFLOW_RESULT')).toBe(false);
+    expect(fetchMock.mock.calls.some((c) => String(c[0]).includes('blocks.cancelAppWorkflow'))).toBe(false);
+  });
+});
