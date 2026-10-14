@@ -1,0 +1,2510 @@
+/**
+ * `createLiveHost` — the LIVE sibling of {@link createMockHost}.
+ *
+ * Where `createMockHost` SYNTHESIZES every reply (no network, no real Buzz),
+ * `createLiveHost` FORWARDS the App-Block postMessage protocol to the REAL
+ * Civitai backend using a short-lived, pasted dev block token (minted via
+ * `POST /api/v1/blocks/dev-token`, scope doc §3 Option A). It lets `dev:live`
+ * run local block code against real compute / real Buzz / the real catalog —
+ * Phase 2 of claudedocs/app-blocks-dev-token-endpoint-scope.md (§5.2).
+ *
+ * It returns the SAME {@link MockHost} interface as `createMockHost` (so a
+ * harness can swap them), but `setScenario` / `buzz` are inert no-ops here —
+ * there are no synthetic scenarios in live mode (the backend is the source of
+ * truth).
+ *
+ * Mechanism (mirrors `createMockHost`):
+ *  1. Patches `window.parent.postMessage` via `Object.defineProperty` so the
+ *     block's OUTBOUND messages are intercepted.
+ *  2. Replies as `MessageEvent`s fired from `window.location.origin` — the SDK
+ *     `IframeTransport` DROPS any inbound message whose `origin` ≠ the allowed
+ *     parent origin, so a block using this in dev MUST allow
+ *     `window.location.origin` (same requirement as the mock host).
+ *  3. On mount, fetches `/api/v1/blocks/me` (Bearer = the dev token) for the
+ *     viewer, decodes the token JWT payload for the block identity / scopes /
+ *     budget / maturity, and dispatches `BLOCK_INIT`.
+ *
+ * REAL NETWORK, REAL MONEY: unlike the mock host, this calls `fetch`. Every
+ * call is Bearer-authed with the dev token and leaves this file through one of
+ * exactly two chokepoints — {@link rawTrpcCall} (every tRPC procedure) and the
+ * `/api/v1/blocks/me` viewer read in `resolveViewer`. A successful submit
+ * SPENDS the dev's OWN real Buzz against real compute. The token's per-call
+ * budget + the per-user daily cap are the server-side bounds (scope doc §4).
+ * (The picker overlay does its own catalog fetch — that lives in
+ * `pickerOverlay.ts`, not here; see PICKERS below.)
+ *
+ * 🔴 THE BLOCK BELOW IS DERIVED FROM THIS FILE. DO NOT HAND-EDIT IT — and do
+ * not re-introduce a typed "the only X is …" list anywhere in this header.
+ * This file grew from 5 network calls to 30 and from 1 refusal to 7 while the
+ * header still said "the only network it does is … the four `blocks.*Workflow`
+ * mutations" and "the ONE capability live mode cannot SERVE" (#387, #14). An
+ * exhaustive count typed into a 2,100-line file that grows every release is a
+ * claim nobody re-measures. So it is measured:
+ * `tests/guards/livehost-header-enumerations.test.mjs` regenerates the block
+ * from the code and fails with the exact replacement text when it drifts.
+ *
+ * --- BEGIN DERIVED ---
+ * fetch chokepoints ..... 2
+ * REST endpoints ........ GET /api/v1/blocks/me
+ * tRPC procedures ....... 28 = blocks.* (13) + apps.shared.* (10) + apps.storage.* (5)
+ * switch case labels .... 47, of which 10 REFUSE (enumerated under SCOPE below)
+ * --- END DERIVED ---
+ *
+ * PICKERS (Phase 1 of "make dev:live a faithful local host"): the live host
+ * SERVES the resource pickers locally. On `OPEN_CHECKPOINT_PICKER` /
+ * `OPEN_RESOURCE_PICKER` it opens an in-harness catalog-browser overlay (real
+ * models fetched with the dev block token via `/api/v1/blocks/models`, public
+ * fallback), the dev picks one, and the host replies with a REAL
+ * `BlockCheckpointInfo` / `BlockResourceInfo` in the EXACT shape the production
+ * host returns — so `useCheckpointPicker` / `useResourcePicker` are byte-identical
+ * in dev:live and in prod (protocol fidelity, not chrome fidelity). A pick is
+ * DISCOVERY ONLY: the server re-validates + prices every id at estimate/submit;
+ * nothing the dev clicks here is trusted or spends Buzz. See the picker handlers.
+ *
+ * APP-STORAGE KV (Phase 4): the live host SERVES the five `APP_STORAGE_*` calls
+ * by forwarding to the block-token `apps.storage.{get,set,delete,list,getQuota}`
+ * tRPC procedures (publicProcedure + verifyBlockToken, FLAT `{ blockToken, … }`
+ * input). Reads need the `apps:storage:read` scope, writes `apps:storage:write`
+ * — the dev token already carries whatever the local manifest declared, and the
+ * server enforces. Real KV — keys namespaced per (block_instance, user), byte
+ * and row budgets enforced per (app, user) — with the REAL ceilings, so a
+ * write this host accepts is one production would accept.
+ *
+ * SET_USER_CHECKPOINT (Phase 4): FORWARDED (faithful) to the block-token
+ * `blocks.updateUserSettings` mutation — never fabricated. The default page
+ * setup mints a PAGE token which lacks `ctx.modelId`, so the backend returns the
+ * honest error "block token lacks modelId context"; that real outcome is
+ * surfaced to the block. With a model-slot token it persists for real.
+ *
+ * SHARED STORAGE (#386): the live host SERVES all TEN `SHARED_*` bridges —
+ * `apps.shared.{list,get,getCount,getCounts,append,update,vote,unvote,withdraw,
+ * report}` — on the same block-token convention as APP_STORAGE. `SHARED_GET`
+ * and `SHARED_REPORT` were the last two missing; until #386 they fell through
+ * the switch's `default: return` with no reply at all, so `useSharedStorage()`
+ * hung to the 30s protocol timeout in dev:live for code that worked in dev:mock.
+ *
+ * 🔴 SCOPE — the capabilities live mode still cannot SERVE. Each REFUSES on its
+ * own reply channel — `logOnce` (or `console.info`) plus an honest error, never
+ * a fabricated success and never silence. Two guards stand behind this list:
+ * `tests/guards/livehost-message-coverage.test.mjs` asserts that no block→parent
+ * type is left without a case at all (the failure mode a refusal is NOT), and
+ * `tests/guards/livehost-header-enumerations.test.mjs` derives the refusal set
+ * from the handlers below and asserts these bullets are exactly it — so the
+ * list cannot silently go stale again the way it did through #14/#387. Add a
+ * refusal handler without a bullet, or leave a bullet whose handler now serves,
+ * and that guard fails naming the difference.
+ *
+ *   • OPEN_BUZZ_PURCHASE — no headless / block-token Buzz-purchase path (buying
+ *     Buzz strictly requires the interactive Stripe/Paddle host chrome). Deep-
+ *     links the real purchase page and replies `purchased: false`.
+ *   • SET_COLLECTION_FOLLOW — needs the session-authed follow procedures plus
+ *     host-chrome consent. Replies `collection-unavailable`.
+ *   • CREATE_POST_FROM_APP — needs the server-resolved preview plus host-chrome
+ *     confirm before a PUBLIC post is written. Replies with a refusal.
+ *   • PREPARE_TRAINING_DATASET — the server refuses every `kind: 'training'`
+ *     request from a dev token, so there is nothing to forward. Replies with a
+ *     refusal.
+ *   • RUN_TRAINING — the same dev-token refusal, plus the host-chrome consent
+ *     dialog a run is confirmed in, which this harness does not have. Replies
+ *     with a refusal.
+ *   • PUBLISH_GENERATION_OUTPUTS — publishing requires the viewer's signed-in
+ *     civitai.com session, which the local harness does not have; test
+ *     publishing against the mock host — `createMockHost` or `Harness` from
+ *     `@civitai/blocks-react/testing`, with the `publishImageIds` /
+ *     `publishError` options. Replies with a refusal.
+ *   • GET_WILDCARD_PACK — needs the session-authed resolve plus the in-tab
+ *     zip/yaml parse that lives in civitai, not this SDK. Replies `parse-failed`.
+ *   • OPEN_IMAGE_UPLOAD — needs the host's native modal + session-authed byte
+ *     pipeline. Replies DISMISSED (the hook resolves `null`).
+ *   • SAVE_IMAGE — the download bridge is the production host's unsandboxed top
+ *     frame plus its CDN origin allowlist / gated per-viewer read. Replies with
+ *     a refusal (#386).
+ *   • REQUEST_CONSENT — live mode cannot grant a scope the token does not carry.
+ *     Pushes `CONSENT_UNAVAILABLE` when the ask is genuinely ungrantable.
+ *
+ * In every case REFUSING IS THE POINT: serving a weakened local imitation would
+ * let a block prove out a flow production does not have, and ship having never
+ * handled the refusal. Use dev:mock for those paths. See the handlers below.
+ */
+
+import {
+  type BlockContext,
+  type BlockInitPayload,
+  type BlockNavigateScope,
+  type BlockWorkflowSnapshot,
+  type ColorDomain,
+  type Theme,
+  type ViewerInfo,
+  type WorkflowBody,
+  type WrappedToken,
+} from '@civitai/app-sdk/blocks';
+
+import { consentUnavailablePayload, resolveUngrantableConsentNotice } from './consent.js';
+import { hostContextWithTheme } from '../transport/transport.js';
+import { isRoutableRequestId } from '../transport/requestId.js';
+import type { MockHost, MockHostScenarioPatch, MockBuzzHandle } from './mockHost.js';
+import {
+  openPickerOverlay,
+  type PickerOverlayHandle,
+  type OpenPickerOptions,
+  type PickerResultChannel,
+} from './pickerOverlay.js';
+
+/** Default civitai backend the live host forwards to. */
+const DEFAULT_BACKEND_BASE_URL = 'https://civitai.com';
+
+/**
+ * Options for {@link createLiveHost}. Mirrors the {@link MockHost}-relevant
+ * subset of `MockHostOptions`, plus the live-only `blockToken` / `backendBaseUrl`
+ * / `fetchImpl`.
+ */
+export interface LiveHostOptions {
+  /**
+   * The PASTED dev block token — a short-lived RS256 JWT minted by
+   * `POST /api/v1/blocks/dev-token`. v1 echoes this token on `REQUEST_TOKEN`
+   * (no auto-refresh); when it expires (~4h) the dev re-mints + restarts.
+   * VITE_-bundled, so it must be SHORT-LIVED — never an API key (scope §5.1).
+   */
+  blockToken: string;
+  /** Backend base URL the protocol forwards to. Default `https://civitai.com`. */
+  backendBaseUrl?: string;
+  /**
+   * Override the viewer used in `BLOCK_INIT` instead of fetching
+   * `/api/v1/blocks/me`. When omitted the host fetches the real viewer (and
+   * falls back to a minimal anon-ish viewer if that fetch fails).
+   */
+  viewer?: ViewerInfo | null;
+  /** Host theme delivered in `BLOCK_INIT` + context. Default `'dark'`. */
+  theme?: Theme;
+  /**
+   * The `BLOCK_INIT` context. Defaults to a COMPLETE `PageSlotContext` mirroring
+   * what `PageBlockHost.buildContext()` sends (slug/subPath/viewerUserId/
+   * viewerUsername/theme), since dev-token mints PAGE tokens only — not a
+   * `{ slotId }` stub, which would not even narrow through `isPageSlotContext`.
+   *
+   * Pass this to set a REAL `slug`: the block token carries no slug claim, so the
+   * default is the placeholder `'live-dev-app'`. `theme` is layered in from
+   * {@link LiveHostOptions.theme} even if the context you pass omits it.
+   */
+  context?: BlockContext;
+  /**
+   * Called with every intercepted OUTBOUND message — lets a harness UI render a
+   * message log (same hook as the mock host's `onOutbound`).
+   */
+  onOutbound?: (msg: { type: string; payload?: unknown }) => void;
+  /** Override `window`. Defaults to `globalThis.window`. */
+  window?: Window & typeof globalThis;
+  /**
+   * Injectable `fetch` (tests pass a mock). Defaults to the global `fetch`.
+   */
+  fetchImpl?: typeof fetch;
+  /**
+   * TEST SEAM for the in-harness picker overlay. Called with the overlay's
+   * {@link PickerOverlayHandle} once its first catalog page has loaded, on every
+   * `OPEN_CHECKPOINT_PICKER` / `OPEN_RESOURCE_PICKER`. Tests use it to drive a
+   * deterministic selection (`handle.selectFirst()` / `selectByVersionId()`) or
+   * a dismissal (`handle.dismiss()`) without synthesizing DOM clicks. In a real
+   * `dev:live` run this is omitted — the dev clicks a card in the overlay.
+   */
+  onPickerReady?: (handle: PickerOverlayHandle) => void;
+}
+
+/** Page slot id — dev-token mints page tokens (mirrors PAGE_SLOT_ID server-side). */
+const PAGE_SLOT_ID = 'app.page';
+
+/** The budgeted-spend scope the workflow procedures require. */
+const BUDGETED_SCOPE = 'ai:write:budgeted';
+
+/**
+ * The reply both training bridges get in dev:live — see their handlers. One
+ * string so the two cannot drift.
+ */
+export const TRAINING_UNSUPPORTED_ERROR = 'training is not supported in dev:live — use dev:mock';
+
+/** The once-per-session console line for a refused training bridge. */
+const trainingUnsupportedLog = (type: string): string =>
+  `${type} is not supported in dev:live (the server refuses every training request from a ` +
+  'dev token, and a run needs the host-chrome consent dialog). Replying with a refusal. ' +
+  'Use dev:mock to exercise the training flow.';
+
+/**
+ * Decoded payload of a block-token JWT (the claims `BlockTokenService.sign`
+ * stamps — see civitai `block-token.service.ts`). Everything is optional/unknown
+ * because the token is dev-pasted: we decode it WITHOUT signature verification
+ * (that's the server's job at the API boundary), purely to seed `BLOCK_INIT`.
+ */
+interface DecodedBlockTokenPayload {
+  blockId?: string;
+  appId?: string;
+  appBlockId?: string;
+  blockInstanceId?: string;
+  ctx?: Record<string, unknown>;
+  scopes?: string[];
+  buzzBudget?: number;
+  maxBrowsingLevel?: number;
+  domain?: ColorDomain | null;
+  sub?: string;
+  /** Unix seconds. */
+  exp?: number;
+}
+
+/**
+ * Decode the middle (payload) segment of a JWT (base64url) WITHOUT verifying
+ * the signature — client-side we only need the claims to build BLOCK_INIT; the
+ * server re-verifies the signature on every API call. Returns `{}` on any
+ * malformed input (never throws).
+ */
+export function decodeBlockTokenPayload(token: string): DecodedBlockTokenPayload {
+  try {
+    const parts = token.split('.');
+    if (parts.length < 2) return {};
+    const payloadSeg = parts[1];
+    if (!payloadSeg) return {};
+    // base64url → base64
+    const b64 = payloadSeg.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4);
+    const json = base64urlDecode(padded);
+    const parsed = JSON.parse(json) as unknown;
+    if (typeof parsed !== 'object' || parsed === null) return {};
+    return parsed as DecodedBlockTokenPayload;
+  } catch {
+    return {};
+  }
+}
+
+/** base64 → utf-8 string, working in both browser (atob) + node (Buffer). */
+function base64urlDecode(b64: string): string {
+  if (typeof atob === 'function') {
+    // atob → binary string; decode as UTF-8.
+    const bin = atob(b64);
+    try {
+      const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+      return new TextDecoder().decode(bytes);
+    } catch {
+      return bin;
+    }
+  }
+  return Buffer.from(b64, 'base64').toString('utf-8');
+}
+
+/**
+ * Build the {@link WrappedToken} the host sends to the block, from the raw token
+ * + its decoded claims. `buzzBudget` is only attached when the token carries the
+ * budgeted scope (mirrors the host: it's present only with `ai:write:budgeted`).
+ */
+function wrappedTokenFrom(raw: string, decoded: DecodedBlockTokenPayload): WrappedToken {
+  const scopes = Array.isArray(decoded.scopes) ? decoded.scopes : [];
+  const expiresAt =
+    typeof decoded.exp === 'number'
+      ? new Date(decoded.exp * 1000).toISOString()
+      : new Date(Date.now() + 15 * 60_000).toISOString();
+  const hasBudget = scopes.includes(BUDGETED_SCOPE) && typeof decoded.buzzBudget === 'number';
+  return {
+    raw,
+    scopes,
+    expiresAt,
+    ...(hasBudget ? { buzzBudget: decoded.buzzBudget } : {}),
+  };
+}
+
+/** `true` when the token's `exp` (Unix seconds) is in the past. */
+function isExpired(decoded: DecodedBlockTokenPayload): boolean {
+  return typeof decoded.exp === 'number' && decoded.exp * 1000 < Date.now();
+}
+
+/**
+ * A failed-shape {@link BlockWorkflowSnapshot} the block can recover from. Used
+ * when a backend call errors so the block's promise resolves instead of hanging
+ * to its 120s timeout. `workflowId` is a non-empty sentinel because the SDK
+ * validator drops empty-workflowId snapshots (mirrors the host's failure shape).
+ */
+function errorSnapshot(error: string): BlockWorkflowSnapshot {
+  return { workflowId: 'failed', status: 'failed', error };
+}
+
+/**
+ * Result of one tRPC mutation call: the parsed snapshot, or an error string.
+ *
+ * `transient` distinguishes a TRANSPORT/INFRA blip (network throw, or an HTTP
+ * status that says "the backend couldn't answer right now" — 5xx / 408 / 429 /
+ * 401) from a genuine, non-retryable error. It is NEVER a workflow `failed`
+ * STATUS: the backend reports a failed *workflow* as a 200 response whose
+ * snapshot has `status: 'failed'`, so a non-2xx / throw on POLL is always a
+ * transport problem, not the orchestrator saying the generation failed. Callers
+ * (the POLL handler) retry transient errors with bounded backoff instead of
+ * synthesizing a terminal `failed` snapshot — see {@link pollWithRetry}.
+ */
+interface TrpcCallResult {
+  snapshot?: BlockWorkflowSnapshot;
+  error?: string;
+  /** True when `error` is a transport/infra blip worth retrying. */
+  transient?: boolean;
+}
+
+/**
+ * The raw result of one tRPC call BEFORE any per-procedure unwrap: the parsed
+ * response envelope (or `undefined` on a thrown fetch / empty body), or an error
+ * string. {@link callTrpcMutation} (workflow path) and {@link callTrpcData}
+ * (storage / checkpoint path) both build on this, so the fetch / parse / status
+ * / error logic lives in exactly one place.
+ */
+interface RawTrpcResult {
+  /** The parsed JSON response (the `{ result: { data: { json } } }` envelope). */
+  parsed?: unknown;
+  error?: string;
+  /** True when `error` is a transport/infra blip worth retrying. */
+  transient?: boolean;
+}
+
+/**
+ * The result of one generic tRPC DATA call: the UNWRAPPED data object the
+ * procedure returned (the storage / settings procs return plain records, not a
+ * `{ snapshot }` wrapper), or an error string. Mirrors {@link TrpcCallResult}'s
+ * `transient` semantics.
+ */
+interface TrpcDataResult {
+  data?: unknown;
+  error?: string;
+  /** True when `error` is a transport/infra blip worth retrying. */
+  transient?: boolean;
+}
+
+/**
+ * Whether an HTTP status from a tRPC call is a transient transport/infra blip
+ * (retry may succeed) vs. a deterministic error. 401 is included because a
+ * not-yet-rolled-out backend pod legitimately 401s for a few seconds during a
+ * deploy (the dev token is fine; the pod just hasn't loaded the verifier yet) —
+ * the exact blip the round-5 dogfood hit. Anything ≥ 500, plus 408 (timeout)
+ * and 429 (rate-limit), is also transient.
+ */
+function isTransientHttpStatus(status: number): boolean {
+  return status >= 500 || status === 408 || status === 429 || status === 401;
+}
+
+/**
+ * Bounded-retry policy for transient POLL transport errors. A few quick
+ * attempts with short exponential backoff (~1.75s total worst case) absorbs a
+ * single bad pod / network hiccup without turning a server-side success into a
+ * terminal `failed`. After the cap, the POLL handler replies with a NON-terminal
+ * `processing` snapshot (keep-polling) rather than fabricating `failed`, so the
+ * block's own poll loop tries again.
+ */
+const POLL_RETRY_BACKOFF_MS = [250, 500, 1000] as const;
+
+/**
+ * Map ONE raw `apps.shared.*` row → the `SharedStorageItemWire` shape the
+ * protocol puts on `SHARED_LIST_RESULT.items` and `SHARED_GET_RESULT.item`.
+ *
+ * ONE mapper, not one per case: the two reads return the same row and the
+ * fields are lenient-by-default (a missing `authorUserId`/`count` becomes `0`,
+ * dates are ISO-normalized whether the transport handed back a `Date` or a
+ * string). A second open-coded copy is how the two reads drift.
+ *
+ * `viewerVoted` is forwarded ONLY when the server actually sent a boolean —
+ * the field is OPTIONAL and additive, and the block-side hook defaults a
+ * missing value to `false`. Omitting it when the server omits it keeps a host
+ * that predates the field indistinguishable from today's behaviour; forwarding
+ * it when the server sends it is what lets a `?g=<key>` deep-link hydrate its
+ * vote button instead of guessing.
+ */
+function sharedItemWireFrom(raw: unknown): {
+  key: string;
+  authorUserId: number;
+  value: unknown;
+  count: number;
+  createdAt: string;
+  updatedAt: string;
+  viewerVoted?: boolean;
+} {
+  const e = raw as {
+    key?: unknown;
+    authorUserId?: unknown;
+    value?: unknown;
+    count?: unknown;
+    createdAt?: unknown;
+    updatedAt?: unknown;
+    viewerVoted?: unknown;
+  };
+  const iso = (d: unknown) => (d instanceof Date ? d.toISOString() : String(d));
+  return {
+    key: String(e.key),
+    authorUserId: typeof e.authorUserId === 'number' ? e.authorUserId : 0,
+    value: e.value,
+    count: typeof e.count === 'number' ? e.count : 0,
+    createdAt: iso(e.createdAt),
+    updatedAt: iso(e.updatedAt),
+    ...(typeof e.viewerVoted === 'boolean' ? { viewerVoted: e.viewerVoted } : {}),
+  };
+}
+
+/**
+ * Create a LIVE host that forwards the App-Block postMessage protocol to the
+ * real Civitai backend. Returns the same {@link MockHost} interface as
+ * {@link createMockHost} (so a harness can swap them); `setScenario` / `buzz`
+ * are no-ops (there are no synthetic scenarios in live mode).
+ *
+ * @example
+ * const host = createLiveHost({ blockToken: import.meta.env.VITE_LIVE_BLOCK_TOKEN });
+ * const uninstall = host.install();
+ * // … drive the block against the REAL backend (real Buzz!) …
+ * uninstall();
+ */
+export function createLiveHost(options: LiveHostOptions): MockHost {
+  const maybeWin =
+    options.window ?? (globalThis as { window?: Window & typeof globalThis }).window;
+  if (!maybeWin) {
+    throw new Error('createLiveHost: no window available (call from a DOM environment).');
+  }
+  const win: Window & typeof globalThis = maybeWin;
+
+  const rawToken = options.blockToken;
+  if (!rawToken || typeof rawToken !== 'string') {
+    // Non-fatal: the host still installs so the dev sees a clear error in the
+    // block, rather than a silently-dead harness.
+    // eslint-disable-next-line no-console
+    console.error(
+      '[createLiveHost] No block token supplied. Set VITE_LIVE_BLOCK_TOKEN to a dev token ' +
+        'minted via POST /api/v1/blocks/dev-token.',
+    );
+  }
+
+  const baseUrl = (options.backendBaseUrl ?? DEFAULT_BACKEND_BASE_URL).replace(/\/+$/, '');
+  // The default fetch MUST be invoked as a method of globalThis. A detached
+  // reference (`const f = globalThis.fetch; f(url)`) throws "Illegal invocation"
+  // in browsers — fetch is a DOM-bound builtin — which broke the catalog/picker
+  // and every live-host network call when no fetchImpl was supplied. Wrap it so
+  // the call is always bound.
+  const fetchImpl: typeof fetch =
+    options.fetchImpl ??
+    ((input, init) => (globalThis as { fetch: typeof fetch }).fetch(input, init));
+  const theme: Theme = options.theme ?? 'dark';
+  const decoded = decodeBlockTokenPayload(rawToken ?? '');
+
+  if (isExpired(decoded)) {
+    // eslint-disable-next-line no-console
+    console.error(
+      '[createLiveHost] dev token expired — re-mint via POST /api/v1/blocks/dev-token and ' +
+        'update VITE_LIVE_BLOCK_TOKEN. Replying with the expired token anyway; the backend ' +
+        'will 401 (the honest signal).',
+    );
+  }
+
+  // A token minted from an OAuth login carries no spend scope (the server
+  // strips `ai:write:budgeted` — the civitai-cli OAuth client has no AI
+  // Services). With such a token the block's `granted` is false, so Generate
+  // calls REQUEST_CONSENT — which live mode CANNOT grant (there's no scope to
+  // re-mint into). Warn UP FRONT, before the dev wastes a click on a Generate
+  // that silently dead-ends. (The CLI also warns at mint time.)
+  const tokenCanSpend = Array.isArray(decoded.scopes) && decoded.scopes.includes(BUDGETED_SCOPE);
+  if (rawToken && !isExpired(decoded) && !tokenCanSpend) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      '[createLiveHost] This dev token is READ-ONLY — it has no `ai:write:budgeted` scope, so ' +
+        'Generate will NOT spend Buzz (REQUEST_CONSENT cannot be granted in live mode). It was ' +
+        'likely minted from an OAuth login. Real generation needs a full-scope personal API key: ' +
+        '`civitai login --token <key>` (https://civitai.com/user/account), then re-mint the dev token.',
+    );
+  }
+
+  // One-time "not supported in live v1" log gating per capability.
+  const loggedOnce = new Set<string>();
+  const logOnce = (key: string, message: string) => {
+    if (loggedOnce.has(key)) return;
+    loggedOnce.add(key);
+    // eslint-disable-next-line no-console
+    console.warn(`[createLiveHost] ${message}`);
+  };
+
+  /**
+   * The single tRPC transport primitive. Builds the non-batched httpLink +
+   * superjson request for `procedure` and returns the PARSED envelope (or an
+   * error). `method` selects the tRPC verb:
+   *   - `'POST'` (mutation): body is `{ json: <input> }`.
+   *   - `'GET'` (query): input is querystring-encoded as
+   *     `?input=encodeURIComponent(JSON.stringify({ json: <input> }))`.
+   * Every call carries `Authorization: Bearer <rawToken>`. A thrown fetch →
+   * `{ error, transient: true }`; a non-2xx → `{ error, transient }` (status-
+   * classified via {@link isTransientHttpStatus}). Both `callTrpcMutation` and
+   * `callTrpcData` build on this so the fetch/parse/error logic lives once.
+   */
+  async function rawTrpcCall(
+    procedure: string,
+    input: Record<string, unknown>,
+    method: 'GET' | 'POST',
+  ): Promise<RawTrpcResult> {
+    if (!fetchImpl) return { error: 'no fetch available' };
+    try {
+      let url = `${baseUrl}/api/trpc/${procedure}`;
+      const init: RequestInit = {
+        method,
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${rawToken}`,
+        },
+      };
+      if (method === 'GET') {
+        // tRPC query: superjson input goes in the querystring.
+        const encoded = encodeURIComponent(JSON.stringify({ json: input }));
+        url = `${url}?input=${encoded}`;
+      } else {
+        // Non-batched httpLink + superjson transformer wraps the input as
+        // `{ json: <input> }` (no `meta` for plain JSON inputs).
+        init.body = JSON.stringify({ json: input });
+      }
+      const res = await fetchImpl(url, init);
+      const text = await res.text();
+      let parsed: unknown;
+      try {
+        parsed = text.length > 0 ? JSON.parse(text) : null;
+      } catch {
+        parsed = null;
+      }
+      if (!res.ok) {
+        const msg = extractTrpcError(parsed) ?? `${procedure} failed: HTTP ${res.status}`;
+        return { error: msg, transient: isTransientHttpStatus(res.status) };
+      }
+      return { parsed };
+    } catch (err) {
+      // A thrown fetch is a network/transport failure (DNS, connection reset,
+      // CORS, offline) — always transient.
+      return { error: err instanceof Error ? err.message : String(err), transient: true };
+    }
+  }
+
+  /**
+   * POST a tRPC WORKFLOW mutation (the `blocks.{estimate,submit,poll,cancel}-
+   * Workflow` procs which return a `{ snapshot }` wrapper). Byte-for-byte
+   * behaviourally identical to the previous direct implementation — still POST,
+   * still {@link extractSnapshot}.
+   */
+  async function callTrpcMutation(
+    procedure: string,
+    input: Record<string, unknown>,
+  ): Promise<TrpcCallResult> {
+    const raw = await rawTrpcCall(procedure, input, 'POST');
+    if (raw.error !== undefined) return { error: raw.error, transient: raw.transient };
+    const snapshot = extractSnapshot(raw.parsed);
+    if (!snapshot) {
+      return { error: `${procedure}: malformed response (no snapshot)` };
+    }
+    return { snapshot };
+  }
+
+  /**
+   * Call a tRPC DATA procedure (storage / settings) and unwrap the plain data
+   * object it returns (via {@link extractData}). `method` is `'GET'` for queries
+   * (`apps.storage.{get,list,getQuota}`) and `'POST'` for mutations
+   * (`apps.storage.{set,delete}`, `blocks.updateUserSettings`).
+   */
+  async function callTrpcData(
+    procedure: string,
+    input: Record<string, unknown>,
+    method: 'GET' | 'POST',
+  ): Promise<TrpcDataResult> {
+    const raw = await rawTrpcCall(procedure, input, method);
+    if (raw.error !== undefined) return { error: raw.error, transient: raw.transient };
+    const data = extractData(raw.parsed);
+    if (data === undefined) {
+      return { error: `${procedure}: malformed response (no data)` };
+    }
+    return { data };
+  }
+
+  /**
+   * POLL with bounded retry of transient transport errors. A genuine workflow
+   * `failed` arrives as a `snapshot` (HTTP 200) and is returned immediately; a
+   * transient transport blip (network throw / 5xx / 408 / 429 / 401) is retried
+   * with {@link POLL_RETRY_BACKOFF_MS} backoff. The final result is only ever a
+   * `snapshot` OR a still-transient error — the caller turns the latter into a
+   * keep-polling `processing` reply, never a fabricated terminal `failed`.
+   */
+  async function pollWithRetry(workflowId: string): Promise<TrpcCallResult> {
+    let last: TrpcCallResult = { error: 'poll failed', transient: true };
+    for (let attempt = 0; attempt <= POLL_RETRY_BACKOFF_MS.length; attempt += 1) {
+      last = await callTrpcMutation('blocks.pollWorkflow', { blockToken: rawToken, workflowId });
+      // A real snapshot (incl. a genuine terminal `failed`) — done.
+      if (last.snapshot) return last;
+      // A non-transient error (malformed response, deterministic 4xx) — don't
+      // burn retries; surface it.
+      if (!last.transient) return last;
+      // Transient: back off and retry, unless we've exhausted the budget.
+      const delay = POLL_RETRY_BACKOFF_MS[attempt];
+      if (delay === undefined) break;
+      await new Promise<void>((resolve) => setTimeout(resolve, delay));
+    }
+    return last;
+  }
+
+  let installed = false;
+  let teardown: () => void = () => {};
+
+  // Current theme + a handle on the installed dispatcher, so `setTheme` can push
+  // a host-initiated `THEME_CHANGE` the way civitai.com does when the viewer
+  // toggles dark mode. Mirrors createMockHost — `dev:live` must be able to
+  // exercise the same push, or a block's live-theme handling is untestable on
+  // the host that is otherwise the closest thing to prod.
+  let currentTheme: Theme = theme;
+  let pushToBlock: ((data: unknown) => void) | null = null;
+
+  // The sub-path the block has been TOLD about, and whether it has been told
+  // anything at all. Together these reproduce the production host's gate
+  // (`PageBlockHost.tsx`: `if (!initSentRef.current || status !== 'ready')
+  // return;` with deps `[subPath, status, send]`), which fires `ROUTE_CHANGED`
+  // only AFTER init and only when the resolved sub-path CHANGES.
+  //
+  // 🔴 SEEDED FROM THE INIT CONTEXT, NOT FROM `''`. The first value reaches the
+  // block in `BLOCK_INIT.context.subPath`, so a harness given
+  // `options.context: { …, subPath: 'compare/42' }` must not then push
+  // `ROUTE_CHANGED { subPath: 'compare/42' }` as if it were a change — the real
+  // host's effect does not fire for the value init already carried.
+  let currentSubPath = '';
+  let initDispatched = false;
+
+  function install(): () => void {
+    if (installed) return teardown;
+    installed = true;
+
+    const parentOrigin = win.location.origin;
+    const originalParent = win.parent;
+    const timers = new Set<ReturnType<typeof setTimeout>>();
+    // Picker overlays currently mounted in the document. Closed on host teardown
+    // so a still-open picker can never outlive the host (or leak a DOM node).
+    const openOverlays = new Set<PickerOverlayHandle>();
+    let torn = false;
+
+    const dispatchToBlock = (data: unknown) => {
+      if (torn) return;
+      win.dispatchEvent(new MessageEvent('message', { data, origin: parentOrigin }));
+    };
+    pushToBlock = dispatchToBlock;
+    const after = (ms: number, fn: () => void) => {
+      const t = setTimeout(() => {
+        timers.delete(t);
+        fn();
+      }, ms);
+      timers.add(t);
+    };
+
+    /** Resolve the viewer for BLOCK_INIT (real fetch, or the override). */
+    async function resolveViewer(): Promise<ViewerInfo | null> {
+      if (options.viewer !== undefined) return options.viewer;
+      if (!fetchImpl) return anonFallbackViewer();
+      try {
+        const res = await fetchImpl(`${baseUrl}/api/v1/blocks/me`, {
+          headers: { authorization: `Bearer ${rawToken}` },
+        });
+        if (!res.ok) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[createLiveHost] /api/v1/blocks/me returned HTTP ${res.status}; using a minimal ` +
+              'anon-ish viewer. Check the dev token is valid + not expired.',
+          );
+          return anonFallbackViewer();
+        }
+        const me = (await res.json()) as {
+          id?: number;
+          username?: string | null;
+          status?: 'active' | 'banned' | 'muted';
+        };
+        if (typeof me.id !== 'number') return anonFallbackViewer();
+        // `/api/v1/blocks/me` is the AUTHORITATIVE self-read and does carry
+        // `status` — but this builds `BLOCK_INIT.viewer`, which the real host
+        // projects down to exactly `{ id, username, signedIn }` (civitai/civitai
+        // `main`'s `withSignedInFlag`). Never moderation state (civitai #2521).
+        // Forwarding `me.status` here would
+        // make the live dev host more generous than production. A block that
+        // wants `status` must ask for it via `GET_VIEWER` / `useViewer()`, which
+        // is exactly the scope-gated path this release steers authors to.
+        return {
+          id: me.id,
+          username: me.username ?? null,
+          signedIn: true,
+        };
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          '[createLiveHost] /api/v1/blocks/me fetch failed; using a minimal anon-ish viewer.',
+          err,
+        );
+        return anonFallbackViewer();
+      }
+    }
+
+    /** Dispatch BLOCK_INIT once the viewer is resolved. */
+    async function dispatchInit() {
+      const viewer = await resolveViewer();
+      if (torn) return;
+      // A FAITHFUL `PageSlotContext` default — see the same note in `mockHost`.
+      // The real `PageBlockHost` always sends slug/subPath/viewerUserId/theme.
+      //
+      // `slug` is a PLACEHOLDER, not a derived value: the block token carries no
+      // slug claim (see `DecodedBlockTokenPayload`), so the live host genuinely
+      // cannot know the app's `<slug>` in `<slug>.civit.ai`. It must not be
+      // filled from `decoded.blockId` — a blockId is a different identifier in a
+      // different namespace, and handing it over as a slug is the kind of
+      // plausible-but-wrong dev value a block would build a URL out of. A dev who
+      // needs the real slug passes `options.context`.
+      const baseContext: BlockContext = options.context ?? {
+        slotId: PAGE_SLOT_ID,
+        entityType: 'none',
+        slug: 'live-dev-app',
+        subPath: '',
+        viewerUserId: viewer?.id ?? null,
+        viewerUsername: viewer?.username ?? null,
+        theme: currentTheme,
+      };
+      const context: BlockContext = hostContextWithTheme(baseContext, currentTheme);
+      // Seed the route ledger from what init actually carries, so the first
+      // `ROUTE_CHANGED` is a change rather than a restatement — see the
+      // declaration of `currentSubPath`.
+      currentSubPath =
+        'subPath' in context && typeof context.subPath === 'string' ? context.subPath : '';
+      const initPayload: BlockInitPayload = {
+        blockInstanceId: decoded.blockInstanceId ?? 'page_live',
+        blockId: decoded.blockId ?? 'live-block',
+        appId: decoded.appId ?? 'app_dev',
+        token: wrappedTokenFrom(rawToken ?? '', decoded),
+        context,
+        settings: { publisherSettings: {}, userSettings: {} },
+        viewer,
+        theme: currentTheme,
+        renderMode: 'iframe',
+        ...(decoded.domain != null ? { domain: decoded.domain } : {}),
+        ...(typeof decoded.maxBrowsingLevel === 'number'
+          ? { maxBrowsingLevel: decoded.maxBrowsingLevel }
+          : {}),
+      };
+      dispatchToBlock({ type: 'BLOCK_INIT', payload: initPayload });
+      initDispatched = true;
+    }
+
+    /**
+     * Reflect a route move back into the block over `ROUTE_CHANGED`, the way
+     * `PageBlockHost` does — the second half of an app-scoped `NAVIGATE`, and
+     * the only way a block learns where a shallow push put it.
+     *
+     * 🔴 THIS REPLACED A SYNTHETIC `popstate`. The earlier shape of this handler
+     * dispatched `new PopStateEvent('popstate')` after `pushState`, which made a
+     * history-based router in the block re-render — in `dev:live` only. Nothing
+     * in production dispatches a `popstate` for a host-side shallow push, so a
+     * block that worked here still showed the wrong view on civitai.com: the
+     * #5209 symptom with its sign flipped, which is the shape that keeps a
+     * platform bug invisible. The message is the real channel; this emits it.
+     *
+     * Three gates, all mirroring the host's own effect:
+     *  - AFTER INIT. The initial sub-path travels in `BLOCK_INIT.context`, and a
+     *    push the transport receives before init has no `context.subPath` to
+     *    update, so it would be silently dropped anyway.
+     *  - ONLY ON A CHANGE. The host's effect is keyed on `[subPath, …]`, so a
+     *    navigation to the route already showing produces no message.
+     *  - CURRENT FRAME ONLY. A `new_tab` navigation does not move THIS frame's
+     *    route, so it must not emit — see the call sites.
+     */
+    const reflectRoute = (subPath: string) => {
+      if (!initDispatched) return;
+      if (subPath === currentSubPath) return;
+      currentSubPath = subPath;
+      dispatchToBlock({ type: 'ROUTE_CHANGED', payload: { subPath } });
+    };
+
+    /**
+     * The sub-path `win.location` currently names, in the shape the host sends:
+     * the segment below the app root, with no leading slash (`''` on the index).
+     *
+     * In `dev:live` the block IS the page, served at this dev origin's own root,
+     * so the app root is `/` and the whole pathname below it is the sub-path.
+     * That is the same mapping the app-scope branch of `NAVIGATE` applies in the
+     * other direction (`/<path>` on this origin), kept in ONE place so the two
+     * cannot disagree.
+     */
+    const subPathFromLocation = () => win.location.pathname.replace(/^\/+/, '');
+
+    // The viewer's OWN back/forward, which production reports too: the host's
+    // effect is keyed on the resolved `subPath`, so it fires for a history move
+    // nobody asked for exactly as it does for a `NAVIGATE`. Without this a block
+    // written against `useCivitaiRoute()` would follow its own navigations here
+    // and ignore the back button — a divergence in the opposite direction to the
+    // one this PR closes, but a divergence.
+    //
+    // `pushState` does NOT fire `popstate`, so our own pushes do not come back
+    // through here; the change gate in `reflectRoute` makes a double-fire inert
+    // regardless.
+    const onPopState = () => reflectRoute(subPathFromLocation());
+    win.addEventListener('popstate', onPopState);
+
+    /**
+     * Open the in-harness picker overlay and resolve it into a picker-result
+     * message. `resultType` is the inbound message type the block awaits
+     * (`CHECKPOINT_PICKER_RESULT` / `RESOURCE_PICKER_RESULT`); a pick dispatches
+     * `{ requestId, selected }`, a dismissal `{ requestId }` (no `selected`) —
+     * EXACTLY the production host's contract, so the hooks are byte-identical.
+     *
+     * DISCOVERY ONLY: the overlay just browses the catalog. The picked id is a
+     * hint — the server re-validates + prices it at estimate/submit. Nothing here
+     * is trusted or spends Buzz.
+     */
+    const openPicker = (
+      params: Pick<OpenPickerOptions, 'type' | 'baseModelGroup' | 'currentVersionId' | 'multiple'>,
+      resultType: PickerResultChannel,
+      requestId: string,
+    ) => {
+      const handle = openPickerOverlay({
+        type: params.type,
+        // 🔴 THE REPLY CHANNEL TRAVELS WITH THE REQUEST (#391). It used to stop
+        // here: the overlay only received `params.type` and branched its
+        // converter on THAT, so an `OPEN_RESOURCE_PICKER` asking for a
+        // Checkpoint replied on `RESOURCE_PICKER_RESULT` with the CHECKPOINT
+        // projection — no `modelType`, which `BlockResourceInfo` requires.
+        // Two independent facts (what was asked for, what channel replies) were
+        // conflated into one; passing the channel down is what separates them.
+        resultChannel: resultType,
+        baseUrl,
+        token: rawToken,
+        fetchImpl,
+        ...(params.baseModelGroup != null ? { baseModelGroup: params.baseModelGroup } : {}),
+        ...(params.currentVersionId != null ? { currentVersionId: params.currentVersionId } : {}),
+        ...(params.multiple ? { multiple: params.multiple } : {}),
+        ...(win.document ? { document: win.document } : {}),
+        ...(options.onPickerReady ? { onReady: options.onPickerReady } : {}),
+        onResolve: (selection) => {
+          openOverlays.delete(handle);
+          if (torn) return;
+          if (params.multiple) {
+            // MULTI-select: the reply shape follows the REQUEST — always a list,
+            // `[]` on dismissal, and never `selected` (the production contract).
+            dispatchToBlock({
+              type: resultType,
+              payload: {
+                requestId,
+                selectedResources:
+                  selection && 'selectedResources' in selection ? selection.selectedResources : [],
+              },
+            });
+            return;
+          }
+          dispatchToBlock({
+            type: resultType,
+            // A dismissal omits `selected` (the hooks resolve to undefined/null).
+            payload: {
+              requestId,
+              ...(selection && 'selected' in selection ? { selected: selection.selected } : {}),
+            },
+          });
+        },
+      });
+      // `openResolve` may have fired synchronously (e.g. a test's onReady that
+      // immediately selects). Only track an overlay that's still open.
+      if (!handle.resolved) openOverlays.add(handle);
+    };
+
+    const parentMock = {
+      postMessage: (msg: unknown) => {
+        if (
+          typeof msg !== 'object' ||
+          msg === null ||
+          typeof (msg as { type?: unknown }).type !== 'string'
+        ) {
+          return;
+        }
+        const typed = msg as {
+          type: string;
+          payload?: {
+            requestId?: string;
+            workflowId?: string;
+            imageIndexes?: number[];
+            imageIds?: number[];
+            title?: string;
+            body?: WorkflowBody;
+            path?: string;
+            /**
+             * NAVIGATE's space selector. Declared as the UNION rather than
+             * `string`, matching the wire type — but every read of it must still
+             * treat an out-of-union value as possible, because this whole object
+             * is a `as` cast over an untyped `postMessage` and a block built
+             * against a newer SDK can send a scope this one has never heard of.
+             * The handler compares against the literal `'site'` for exactly that
+             * reason: unknown fails closed onto `'app'`, as the host does.
+             */
+            scope?: BlockNavigateScope;
+            target?: 'current' | 'new_tab';
+            suggestedAmount?: number;
+            baseModelGroup?: string;
+            currentVersionId?: number;
+            resourceType?: 'Checkpoint' | 'LORA';
+            key?: string;
+            keys?: string[];
+            value?: unknown;
+            prefix?: string;
+            limit?: number;
+            cursor?: string;
+            versionId?: number | null;
+            params?: Record<string, unknown>;
+            modelVersionId?: number;
+            /** SHARED_REPORT — optional free-text reason (bounded server-side). */
+            reason?: string;
+          };
+        };
+
+        options.onOutbound?.({ type: typed.type, payload: typed.payload });
+
+        const requestId = typed.payload?.requestId;
+
+        switch (typed.type) {
+          case 'BLOCK_READY':
+          case 'RESIZE_IFRAME':
+            // Iframe resize: no host chrome to resize in dev (the harness owns
+            // layout). No-op, mirroring the mock host.
+            return;
+
+          case 'REQUEST_TOKEN': {
+            if (isExpired(decoded)) {
+              // eslint-disable-next-line no-console
+              console.error(
+                '[createLiveHost] REQUEST_TOKEN: dev token is expired — re-mint via ' +
+                  'POST /api/v1/blocks/dev-token and update VITE_LIVE_BLOCK_TOKEN. ' +
+                  'Replying with the expired token; the backend will 401.',
+              );
+            }
+            // v1 echoes the pasted token (no auto-refresh / re-mint).
+            dispatchToBlock({
+              type: 'TOKEN_REFRESH_RESPONSE',
+              payload: {
+                ...(isRoutableRequestId(requestId) ? { requestId } : {}),
+                token: wrappedTokenFrom(rawToken ?? '', decoded),
+              },
+            });
+            return;
+          }
+
+          case 'ESTIMATE_WORKFLOW': {
+            const body = typed.payload?.body;
+            void callTrpcMutation('blocks.estimateWorkflow', { blockToken: rawToken, body }).then(
+              (r) => {
+                dispatchToBlock({
+                  type: 'ESTIMATE_RESULT',
+                  payload: {
+                    requestId,
+                    snapshot: r.snapshot ?? errorSnapshot(r.error ?? 'estimate failed'),
+                  },
+                });
+              },
+            );
+            return;
+          }
+
+          case 'SUBMIT_WORKFLOW': {
+            const body = typed.payload?.body;
+            // 🔴 KNOWN GAP, DELIBERATELY NOT CHANGED HERE — see below before
+            // "fixing" it. Every tRPC failure collapses into `errorSnapshot()`,
+            // i.e. the `'failed'` sentinel with no cost, which the SDK reports as
+            // `WorkflowSubmitError` code `'exception'`. That code's docs are now
+            // careful to say "the host had no workflow to report", NOT "nothing
+            // was charged" — precisely because a TRANSIENT failure (the ≥500 /
+            // 408 / 429 / 401 class this file already models in
+            // `isTransientHttpStatus`) can arrive AFTER the orchestrator created
+            // and charged a workflow.
+            //
+            // `r.transient` is available on this result and is deliberately
+            // unread. The POLL path below refuses to synthesize a terminal
+            // `failed` for exactly this reason — but poll has a workflowId to
+            // keep polling with and submit does not, so the same remedy does not
+            // transfer, and inventing one is a behaviour change on a path where
+            // `dev:live` spends REAL Buzz. Threading it through is tracked
+            // separately rather than bolted on here.
+            void callTrpcMutation('blocks.submitWorkflow', { blockToken: rawToken, body }).then(
+              (r) => {
+                dispatchToBlock({
+                  type: 'WORKFLOW_SUBMITTED',
+                  payload: {
+                    requestId,
+                    snapshot: r.snapshot ?? errorSnapshot(r.error ?? 'submit failed'),
+                  },
+                });
+              },
+            );
+            return;
+          }
+
+          case 'POLL_WORKFLOW': {
+            const workflowId = typed.payload?.workflowId ?? '';
+            void pollWithRetry(workflowId).then((r) => {
+              // Snapshot present (incl. a genuine terminal `failed` from the
+              // backend) — forward it as-is.
+              if (r.snapshot) {
+                dispatchToBlock({
+                  type: 'WORKFLOW_STATUS',
+                  payload: { requestId, snapshot: r.snapshot },
+                });
+                return;
+              }
+              // A still-transient transport error AFTER bounded retries must NOT
+              // become a terminal `failed` (the workflow may well be succeeding
+              // server-side). Reply with a NON-terminal `processing` snapshot
+              // carrying the transient error so the block's poll loop keeps
+              // polling and the real outcome surfaces on a later tick. A genuine
+              // workflow failure only ever arrives as `r.snapshot.status` ===
+              // 'failed' above.
+              const transient = r.transient ?? false;
+              logOnce(
+                'poll-transient',
+                `pollWorkflow transport error (kept polling, not failed): ${r.error ?? 'unknown'}`,
+              );
+              dispatchToBlock({
+                type: 'WORKFLOW_STATUS',
+                payload: {
+                  requestId,
+                  // keeps the workflowId so the block maps it back to the right card.
+                  snapshot: {
+                    workflowId,
+                    status: transient ? ('processing' as const) : ('failed' as const),
+                    error: r.error ?? 'poll failed',
+                  },
+                },
+              });
+            });
+            return;
+          }
+
+          case 'CANCEL_WORKFLOW': {
+            const workflowId = typed.payload?.workflowId ?? '';
+            void callTrpcMutation('blocks.cancelWorkflow', {
+              blockToken: rawToken,
+              workflowId,
+            }).then((r) => {
+              dispatchToBlock({
+                type: 'WORKFLOW_CANCELED',
+                payload: {
+                  requestId,
+                  snapshot:
+                    r.snapshot ?? {
+                      workflowId,
+                      status: 'canceled' as const,
+                      error: r.error ?? 'cancel failed',
+                    },
+                },
+              });
+            });
+            return;
+          }
+
+          case 'OPEN_BUZZ_PURCHASE': {
+            // No headless purchase contract. Deep-link the dev to the real
+            // purchase page and reply purchased:false (honest — we can't observe
+            // the out-of-band purchase). Do NOT fabricate purchased:true.
+            try {
+              win.open(`${baseUrl}/purchase/buzz`, '_blank');
+            } catch {
+              /* window.open may be unavailable (tests) — the reply still lands */
+            }
+            // eslint-disable-next-line no-console
+            console.info(
+              '[createLiveHost] Opened the Buzz purchase page in a new tab. Complete the ' +
+                'purchase there, then re-estimate / re-submit.',
+            );
+            dispatchToBlock({
+              type: 'BUZZ_PURCHASE_RESULT',
+              payload: { requestId: requestId ?? '', purchased: false },
+            });
+            return;
+          }
+
+          case 'GET_BUZZ_BALANCE': {
+            // Read the viewer's per-pool Buzz balance via the token-bound
+            // `blocks.getMyBuzzBalance` tRPC MUTATION (POST — the block JWT rides
+            // in the request body, never the URL). It returns a plain
+            // `{ blue, green, yellow }` object, so unwrap it with `callTrpcData`
+            // (NOT `callTrpcMutation`, which expects a `{ snapshot }` wrapper).
+            // Mirrors the `APP_STORAGE_SET` value-or-error convention. Drop a
+            // request with no `requestId` — the block correlates the reply by it,
+            // so a reply without one is unroutable.
+            if (!isRoutableRequestId(requestId)) return;
+            void callTrpcData(
+              'blocks.getMyBuzzBalance',
+              { blockToken: rawToken },
+              'POST',
+            ).then((r) => {
+              dispatchToBlock({
+                type: 'BUZZ_BALANCE_RESULT',
+                payload: r.data
+                  ? { requestId, balance: r.data }
+                  : { requestId, error: r.error ?? 'balance unavailable' },
+              });
+            });
+            return;
+          }
+
+          case 'GET_VIEWER': {
+            // Read the signed-in viewer via the token-bound `blocks.getMyViewer`
+            // tRPC MUTATION (POST — the block JWT rides in the request body,
+            // never the URL). It returns a plain `{ id, username, status,
+            // buzzBudget? }` object, so unwrap it with `callTrpcData` (NOT
+            // `callTrpcMutation`, which expects a `{ snapshot }` wrapper). FREE-
+            // TEXT error on failure (anon / banned viewer). Drop a request with
+            // no `requestId` — the block correlates the reply by it, so a reply
+            // without one is unroutable.
+            if (!isRoutableRequestId(requestId)) return;
+            void callTrpcData(
+              'blocks.getMyViewer',
+              { blockToken: rawToken },
+              'POST',
+            ).then((r) => {
+              dispatchToBlock({
+                type: 'VIEWER_RESULT',
+                payload: r.data
+                  ? { requestId, viewer: r.data }
+                  : { requestId, error: r.error ?? 'viewer unavailable' },
+              });
+            });
+            return;
+          }
+
+          case 'GET_BUZZ_TRANSACTIONS': {
+            // Ledger read via the token-bound `blocks.getMyBuzzTransactions`
+            // MUTATION (POST). params are spread FIRST so the host-authoritative
+            // `blockToken` (spread LAST) can never be overridden — mirrors the
+            // real host. FREE-TEXT error on failure. Unroutable without requestId.
+            if (!isRoutableRequestId(requestId)) return;
+            void callTrpcData(
+              'blocks.getMyBuzzTransactions',
+              { ...(typed.payload?.params ?? {}), blockToken: rawToken },
+              'POST',
+            ).then((r) => {
+              dispatchToBlock({
+                type: 'BUZZ_TRANSACTIONS_RESULT',
+                payload: r.data
+                  ? { requestId, result: r.data }
+                  : { requestId, error: r.error ?? 'buzz transactions unavailable' },
+              });
+            });
+            return;
+          }
+
+          case 'GET_BUZZ_ACCOUNTS': {
+            if (!isRoutableRequestId(requestId)) return;
+            void callTrpcData(
+              'blocks.getMyBuzzAccounts',
+              { blockToken: rawToken },
+              'POST',
+            ).then((r) => {
+              dispatchToBlock({
+                type: 'BUZZ_ACCOUNTS_RESULT',
+                payload: r.data
+                  ? { requestId, result: r.data }
+                  : { requestId, error: r.error ?? 'buzz accounts unavailable' },
+              });
+            });
+            return;
+          }
+
+          case 'GET_DAILY_COMPENSATION': {
+            if (!isRoutableRequestId(requestId)) return;
+            void callTrpcData(
+              'blocks.getMyDailyCompensation',
+              { ...(typed.payload?.params ?? {}), blockToken: rawToken },
+              'POST',
+            ).then((r) => {
+              dispatchToBlock({
+                type: 'DAILY_COMPENSATION_RESULT',
+                payload: r.data
+                  ? { requestId, result: r.data }
+                  : { requestId, error: r.error ?? 'daily compensation unavailable' },
+              });
+            });
+            return;
+          }
+
+          case 'SET_COLLECTION_FOLLOW': {
+            // UNSUPPORTED in live v1, for the SAME reason as GET_WILDCARD_PACK
+            // directly below: the real host calls the SESSION-authed
+            // `collection.follow` / `collection.unfollow` tRPC procedures and
+            // resolves the collection's identity through an authenticated read
+            // before opening its own chrome confirm. A liveHost holds a BLOCK
+            // token, not a session, and has no civitai chrome to confirm in.
+            //
+            // 🔴 REFUSING IS THE POINT, NOT A LIMITATION TO ROUTE AROUND. The
+            // HTTP endpoint this bridge replaces is still live and this harness
+            // COULD call it with the block token — and doing so would exercise a
+            // path with NO consent confirm, i.e. dev would prove out a flow the
+            // production bridge does not have. A block would then ship having
+            // never once handled `declined`.
+            //
+            // `collection-unavailable`, not `sign-in-required`: the honest
+            // statement is that this host could not resolve the collection, and
+            // it is the code that already covers "the lookup itself failed".
+            // `sign-in-required` would send the block into a REQUEST_SIGN_IN
+            // loop against a harness that has no sign-in. Use dev:mock (its
+            // `collectionFollowError` knob covers `declined` and the rest) to
+            // exercise the real refusal set.
+            if (!isRoutableRequestId(requestId)) return;
+            logOnce(
+              'collection-follow',
+              'SET_COLLECTION_FOLLOW is not supported in dev:live (it needs the session-authed ' +
+                'follow procedures plus host-chrome consent). Replying `collection-unavailable`. ' +
+                'Use dev:mock to exercise the follow bridge, including the `declined` path.',
+            );
+            dispatchToBlock({
+              type: 'COLLECTION_FOLLOW_RESULT',
+              payload: { requestId, error: 'collection-unavailable' },
+            });
+            return;
+          }
+
+          case 'CREATE_POST_FROM_APP': {
+            // UNSUPPORTED in live v1, for a STRONGER version of the
+            // SET_COLLECTION_FOLLOW reason directly above. The real host makes
+            // TWO server calls: a read-only preview that resolves — server-side
+            // — the copy, the tag names that will actually be applied, the
+            // host-fetched model/version names and real thumbnails; and only
+            // then, after the viewer confirms in CIVITAI CHROME, the write. This
+            // harness has no civitai chrome to render that dialog in.
+            //
+            // 🔴 REFUSING IS THE POINT. A dev token minted for this harness
+            // cannot carry `posts:write:self` anyway, but even if it could,
+            // driving the write without the preview+confirm would let dev prove
+            // out a flow production does not have — and here the thing dev would
+            // be proving out is a PUBLIC POST under someone's name. A block
+            // would ship having never once handled `declined`.
+            //
+            // FREE TEXT, not a host code: none of the closed codes is honest
+            // about "this harness cannot do it", and the error channel is
+            // explicitly a union of codes and server messages. `useCreatePostFromApp`
+            // surfaces it as `.code === undefined`, i.e. a message worth showing.
+            // Use dev:mock (its `createPostError` knob covers `declined` and the
+            // rest) to exercise the refusal set.
+            if (!isRoutableRequestId(requestId)) return;
+            logOnce(
+              'create-post',
+              'CREATE_POST_FROM_APP is not supported in dev:live (it needs the server-resolved ' +
+                'preview plus host-chrome consent). Replying with a refusal. Use dev:mock to ' +
+                'exercise the post bridge, including the `declined` path.',
+            );
+            dispatchToBlock({
+              type: 'CREATE_POST_RESULT',
+              payload: {
+                requestId,
+                error: 'creating posts is not supported in dev:live — use dev:mock',
+              },
+            });
+            return;
+          }
+
+          case 'PREPARE_TRAINING_DATASET': {
+            // UNSUPPORTED in live, and here the SERVER decides it, not this
+            // harness: every `kind: 'training'` procedure refuses a dev token
+            // ("training is not available from a development or review session"
+            // — `assertTrainingRequestAllowed` in civitai/civitai), because there
+            // is no host page whose chrome can show the viewer a price. A
+            // training ESTIMATE is still forwarded (ESTIMATE_WORKFLOW above) and
+            // comes back carrying that same server refusal.
+            //
+            // FREE TEXT on the message's own reply channel; no host code is
+            // honest about "this harness cannot do it". Use dev:mock — its
+            // `trainingDatasetError` / `trainingDatasetRejected` knobs cover the
+            // refusal set.
+            if (!isRoutableRequestId(requestId)) return;
+            logOnce('training-dataset', trainingUnsupportedLog('PREPARE_TRAINING_DATASET'));
+            dispatchToBlock({
+              type: 'TRAINING_DATASET_RESULT',
+              payload: { requestId, error: TRAINING_UNSUPPORTED_ERROR },
+            });
+            return;
+          }
+
+          case 'RUN_TRAINING': {
+            // UNSUPPORTED in live for the same server-side reason as
+            // PREPARE_TRAINING_DATASET directly above — and doubly so: a run is
+            // CHARGED and confirmed in host chrome this harness does not have, so
+            // faking either half would let dev prove out a flow production does
+            // not have. Use dev:mock — its `runTrainingError` knob covers
+            // `declined`, `submission-unconfirmed` and the rest.
+            if (!isRoutableRequestId(requestId)) return;
+            logOnce('training-run', trainingUnsupportedLog('RUN_TRAINING'));
+            dispatchToBlock({
+              type: 'TRAINING_RESULT',
+              payload: { requestId, error: TRAINING_UNSUPPORTED_ERROR },
+            });
+            return;
+          }
+
+          case 'GET_WILDCARD_PACK': {
+            // UNSUPPORTED in live v1 (honest-by-design, like OPEN_BUZZ_PURCHASE):
+            // the real host resolves the pack via a SESSION-authed proc and does
+            // the fetch + unzip + parse in the viewer's page tab (the jszip/js-yaml
+            // machinery lives in civitai, not this SDK). A liveHost holds a BLOCK
+            // token, not a session — so it cannot resolve the pack. Reply with an
+            // honest `parse-failed` (never a fabricated pack) so the block's hook
+            // surfaces a typed error rather than hanging. Use dev:mock for the
+            // full wildcard-import path.
+            if (!isRoutableRequestId(requestId)) return;
+            logOnce(
+              'wildcard-pack',
+              'GET_WILDCARD_PACK is not supported in dev:live (it needs the session-authed ' +
+                'resolve + in-tab zip parse). Replying `parse-failed`. Use dev:mock to exercise ' +
+                'the wildcard-pack import path.',
+            );
+            dispatchToBlock({
+              type: 'WILDCARD_PACK_RESULT',
+              payload: { requestId, error: 'parse-failed' },
+            });
+            return;
+          }
+
+          case 'QUERY_APP_WORKFLOWS': {
+            // App generator SUBQUEUE read via the token-bound
+            // `blocks.queryAppWorkflows` MUTATION (POST). params (cursor/limit) are
+            // spread FIRST so the host-authoritative `blockToken` (spread LAST) can
+            // never be overridden — mirrors the real host; the host also forces the
+            // per-app tag filter server-side (the input carries no `tags`). It
+            // returns a plain `{ workflows, cursor }`, unwrapped with `callTrpcData`.
+            // FREE-TEXT error on failure. Unroutable without requestId.
+            if (!isRoutableRequestId(requestId)) return;
+            void callTrpcData(
+              'blocks.queryAppWorkflows',
+              { ...(typed.payload?.params ?? {}), blockToken: rawToken },
+              'POST',
+            ).then((r) => {
+              dispatchToBlock({
+                type: 'APP_WORKFLOWS_RESULT',
+                payload: r.data
+                  ? { requestId, result: r.data }
+                  : { requestId, error: r.error ?? 'app workflows unavailable' },
+              });
+            });
+            return;
+          }
+
+          case 'CANCEL_APP_WORKFLOW': {
+            // Cancel ONE subqueue workflow via the token-bound
+            // `blocks.cancelAppWorkflow` MUTATION (POST). FAIL-CLOSED server-side
+            // (ownership + app-tag guard). Returns a plain `{ workflow }` (the
+            // terminal projection), unwrapped with `callTrpcData`. FREE-TEXT error
+            // on failure (FORBIDDEN / transport). Drop a request with no requestId
+            // or a missing/empty workflowId (mirrors the real host).
+            if (!isRoutableRequestId(requestId)) return;
+            const cancelId = typed.payload?.workflowId;
+            if (typeof cancelId !== 'string' || cancelId.length === 0) return;
+            void callTrpcData(
+              'blocks.cancelAppWorkflow',
+              { blockToken: rawToken, workflowId: cancelId },
+              'POST',
+            ).then((r) => {
+              dispatchToBlock({
+                type: 'CANCEL_APP_WORKFLOW_RESULT',
+                payload: r.data
+                  ? { requestId, result: r.data }
+                  : { requestId, error: r.error ?? 'cancel failed' },
+              });
+            });
+            return;
+          }
+
+          case 'PUBLISH_GENERATION_OUTPUTS': {
+            // UNSUPPORTED in live, for the same reason as CREATE_POST_FROM_APP
+            // above: publishing requires the viewer's signed-in civitai.com
+            // session, which the local harness does not have — it holds a dev
+            // block token and has no civitai chrome to render the publish
+            // confirm in. On civitai.com the real host resolves the workflow's
+            // outputs, shows that confirm, and only then publishes bare,
+            // real-scanned public Image rows.
+            //
+            // FREE TEXT, like the post refusal: none of the host's codes is
+            // honest about "this harness cannot do it". `usePublishGenerationOutputs`
+            // rejects with it as the message. Test publishing against the mock
+            // host — `createMockHost` or `Harness` from
+            // `@civitai/blocks-react/testing`, with the `publishImageIds` /
+            // `publishError` options.
+            if (!isRoutableRequestId(requestId)) return;
+            logOnce(
+              'publish-outputs',
+              'PUBLISH_GENERATION_OUTPUTS is not supported in dev:live (publishing requires the ' +
+                "viewer's signed-in civitai.com session, which the local harness does not have). " +
+                'Replying with a refusal. Test publishing against the mock host — createMockHost ' +
+                'or Harness from @civitai/blocks-react/testing, with the publishImageIds / ' +
+                'publishError options.',
+            );
+            dispatchToBlock({
+              type: 'PUBLISH_RESULT',
+              payload: {
+                requestId,
+                error:
+                  'publishing generation outputs is not supported in dev:live — publishing ' +
+                  "requires the viewer's signed-in civitai.com session, which the local harness " +
+                  'does not have; test publishing against the mock host — createMockHost or ' +
+                  'Harness from @civitai/blocks-react/testing, with the publishImageIds / ' +
+                  'publishError options',
+              },
+            });
+            return;
+          }
+
+          case 'GET_IMAGES_BY_IDS': {
+            // Per-viewer gated image read via the token-bound `blocks.getImagesByIds`
+            // MUTATION (POST). The host applies the requesting viewer's
+            // browsing-level clamp server-side and returns a plain `{ images }`
+            // (`BlockGatedImage[]` — visible/hidden), unwrapped with `callTrpcData`.
+            // FREE-TEXT error on failure. Unroutable without requestId.
+            if (!isRoutableRequestId(requestId)) return;
+            void callTrpcData(
+              'blocks.getImagesByIds',
+              { blockToken: rawToken, imageIds: typed.payload?.imageIds ?? [] },
+              'POST',
+            ).then((r) => {
+              dispatchToBlock({
+                type: 'IMAGES_RESULT',
+                payload: r.data
+                  ? { requestId, result: r.data }
+                  : { requestId, error: r.error ?? 'gated images unavailable' },
+              });
+            });
+            return;
+          }
+
+          case 'OPEN_CHECKPOINT_PICKER': {
+            // Serve the picker locally: open the in-harness catalog browser
+            // filtered to Checkpoints in the requested ecosystem, pre-highlight
+            // the current pick, and reply with a REAL BlockCheckpointInfo (or no
+            // `selected` on dismissal) — the production contract. DISCOVERY ONLY:
+            // the server re-validates + prices the picked id at estimate/submit.
+            openPicker(
+              {
+                type: 'Checkpoint',
+                ...(typeof typed.payload?.baseModelGroup === 'string'
+                  ? { baseModelGroup: typed.payload.baseModelGroup }
+                  : {}),
+                ...(typeof typed.payload?.currentVersionId === 'number'
+                  ? { currentVersionId: typed.payload.currentVersionId }
+                  : {}),
+              },
+              'CHECKPOINT_PICKER_RESULT',
+              requestId ?? '',
+            );
+            return;
+          }
+
+          case 'OPEN_RESOURCE_PICKER': {
+            // Same as the checkpoint picker but for the requested resourceType
+            // (v1: 'Checkpoint' | 'LORA'). Replies with a REAL BlockResourceInfo
+            // (or no `selected` on dismissal). DISCOVERY ONLY — re-priced +
+            // re-validated server-side at estimate/submit.
+            const resourceType: 'Checkpoint' | 'LORA' =
+              typed.payload?.resourceType === 'Checkpoint' ? 'Checkpoint' : 'LORA';
+            // MULTI-select (`multiple: { max }`) — the production host's rules:
+            // LoRA only, `max` a whole number ≥ 1 clamped to 5, and a refusal is
+            // ANSWERED with `error` (the hook throws on it) rather than opening
+            // a single-pick overlay the block did not ask for.
+            const rawMultiple = (typed.payload as { multiple?: unknown } | undefined)?.multiple;
+            let multiple: { max: number } | undefined;
+            if (rawMultiple !== undefined && rawMultiple !== null) {
+              const max =
+                typeof rawMultiple === 'object' ? (rawMultiple as { max?: unknown }).max : undefined;
+              const refusal =
+                resourceType === 'Checkpoint'
+                  ? 'OPEN_RESOURCE_PICKER: multiple is only supported for LoRA-family resource types, not Checkpoint.'
+                  : typeof max !== 'number' || !Number.isInteger(max) || max < 1
+                    ? 'OPEN_RESOURCE_PICKER: multiple.max must be a whole number of at least 1.'
+                    : null;
+              if (refusal !== null) {
+                // A refusal nobody can route is not worth sending.
+                if (!isRoutableRequestId(requestId)) return;
+                dispatchToBlock({
+                  type: 'RESOURCE_PICKER_RESULT',
+                  payload: { requestId, error: refusal },
+                });
+                return;
+              }
+              multiple = { max: Math.min(max as number, 5) };
+            }
+            openPicker(
+              {
+                type: resourceType,
+                ...(typeof typed.payload?.baseModelGroup === 'string'
+                  ? { baseModelGroup: typed.payload.baseModelGroup }
+                  : {}),
+                ...(multiple ? { multiple } : {}),
+              },
+              'RESOURCE_PICKER_RESULT',
+              requestId ?? '',
+            );
+            return;
+          }
+
+          case 'OPEN_IMAGE_UPLOAD': {
+            // No headless upload contract: the real image-upload flow needs the
+            // host's native modal + the session-authed byte pipeline, neither of
+            // which the dev harness has. Rather than let `useImageUpload()` hang
+            // to its 10-minute picker timeout, reply DISMISSED (no `selected`, so
+            // the hook resolves to `null`) and log an actionable message. Honest-
+            // by-design — never fabricate a moderated image id. Mirrors the
+            // OPEN_BUZZ_PURCHASE "no headless contract" pattern.
+            //
+            // The `bytes` variant (`useUploadImageBytes()`) gets the same reply,
+            // but that hook has no "dismissed" outcome: it REJECTS with its
+            // no-image error. So it gets its own message, naming its mock option.
+            if (typed.payload != null && 'bytes' in (typed.payload as object)) {
+              logOnce(
+                'open-image-upload-bytes',
+                'OPEN_IMAGE_UPLOAD { bytes } received but live dev mode has no bytes upload path — ' +
+                  'useUploadImageBytes().upload() REJECTS with "the host returned no uploaded image". ' +
+                  'Test the bytes upload against the real site, or use ' +
+                  'createMockHost({ uploadImageBytesResult }) in dev:mock.',
+              );
+            } else {
+              logOnce(
+                'open-image-upload',
+                'OPEN_IMAGE_UPLOAD received but live dev mode cannot serve the native upload ' +
+                  'modal — resolving the upload as dismissed (null). Test the image-upload flow ' +
+                  'against the real site, or use createMockHost({ cannedImageUpload }) in dev:mock.',
+              );
+            }
+            dispatchToBlock({
+              type: 'IMAGE_UPLOAD_RESULT',
+              payload: { requestId: requestId ?? '' },
+            });
+            return;
+          }
+
+          case 'SET_USER_CHECKPOINT': {
+            // FORWARD (faithful) to blocks.updateUserSettings — never fabricate.
+            // Mirror the prod IframeHost's versionId validation: a number or an
+            // explicit null is valid; anything else is rejected WITHOUT a backend
+            // call. NOTE: dev-token mints PAGE tokens which lack `ctx.modelId`, so
+            // with the default page setup the backend returns the honest error
+            // "block token lacks modelId context" — this is FAITHFUL (it surfaces
+            // the real outcome) and works for real with a model-slot token.
+            const rawVersionId = typed.payload?.versionId;
+            const versionId =
+              rawVersionId === null
+                ? null
+                : typeof rawVersionId === 'number'
+                  ? rawVersionId
+                  : undefined;
+            if (versionId === undefined) {
+              dispatchToBlock({
+                type: 'USER_CHECKPOINT_SET',
+                payload: {
+                  requestId: requestId ?? '',
+                  ok: false,
+                  error: 'versionId must be a number or null',
+                },
+              });
+              return;
+            }
+            void callTrpcData(
+              'blocks.updateUserSettings',
+              { blockToken: rawToken, settings: { checkpoint_version_id: versionId } },
+              'POST',
+            ).then((r) => {
+              dispatchToBlock({
+                type: 'USER_CHECKPOINT_SET',
+                payload: r.error
+                  ? { requestId: requestId ?? '', ok: false, error: r.error }
+                  : { requestId: requestId ?? '', ok: true },
+              });
+            });
+            return;
+          }
+
+          case 'APP_STORAGE_GET': {
+            // Query apps.storage.get {blockToken, key} (GET). The server enforces
+            // the apps:storage:read scope; the dev token carries it iff the local
+            // manifest declared it.
+            const key = typed.payload?.key ?? '';
+            void callTrpcData('apps.storage.get', { blockToken: rawToken, key }, 'GET').then(
+              (r) => {
+                if (r.error) {
+                  dispatchToBlock({
+                    type: 'APP_STORAGE_GET_RESULT',
+                    payload: { requestId: requestId ?? '', value: null, error: r.error },
+                  });
+                  return;
+                }
+                const value = (r.data as { value?: unknown })?.value ?? null;
+                dispatchToBlock({
+                  type: 'APP_STORAGE_GET_RESULT',
+                  payload: { requestId: requestId ?? '', value },
+                });
+              },
+            );
+            return;
+          }
+
+          case 'APP_STORAGE_SET': {
+            // Mutation apps.storage.set {blockToken, key, value} (POST). The
+            // server enforces apps:storage:write + the per-value cap and both
+            // per-(app, viewer) budgets — no simulation here, so nothing to
+            // keep in sync.
+            const key = typed.payload?.key ?? '';
+            const value = typed.payload?.value;
+            void callTrpcData(
+              'apps.storage.set',
+              { blockToken: rawToken, key, value },
+              'POST',
+            ).then((r) => {
+              if (r.error) {
+                dispatchToBlock({
+                  type: 'APP_STORAGE_SET_RESULT',
+                  payload: { requestId: requestId ?? '', ok: false, error: r.error },
+                });
+                return;
+              }
+              const sizeBytes = (r.data as { sizeBytes?: unknown })?.sizeBytes;
+              dispatchToBlock({
+                type: 'APP_STORAGE_SET_RESULT',
+                payload: {
+                  requestId: requestId ?? '',
+                  ok: true,
+                  ...(typeof sizeBytes === 'number' ? { sizeBytes } : {}),
+                },
+              });
+            });
+            return;
+          }
+
+          case 'APP_STORAGE_DELETE': {
+            // Mutation apps.storage.delete {blockToken, key} (POST).
+            const key = typed.payload?.key ?? '';
+            void callTrpcData(
+              'apps.storage.delete',
+              { blockToken: rawToken, key },
+              'POST',
+            ).then((r) => {
+              if (r.error) {
+                dispatchToBlock({
+                  type: 'APP_STORAGE_DELETE_RESULT',
+                  payload: {
+                    requestId: requestId ?? '',
+                    ok: false,
+                    deleted: false,
+                    error: r.error,
+                  },
+                });
+                return;
+              }
+              dispatchToBlock({
+                type: 'APP_STORAGE_DELETE_RESULT',
+                payload: {
+                  requestId: requestId ?? '',
+                  ok: true,
+                  deleted: Boolean((r.data as { deleted?: unknown })?.deleted),
+                },
+              });
+            });
+            return;
+          }
+
+          case 'APP_STORAGE_LIST': {
+            // Query apps.storage.list {blockToken, prefix?, limit, cursor?} (GET).
+            // Clamp the limit to the server's [1,200] bound (default 50); only
+            // include prefix/cursor when they're strings so JSON.stringify drops
+            // the undefined keys (the server input is `.optional()`).
+            const rawLimit = typed.payload?.limit;
+            const limit =
+              typeof rawLimit === 'number'
+                ? Math.min(Math.max(Math.floor(rawLimit), 1), 200)
+                : 50;
+            const prefix = typed.payload?.prefix;
+            const cursor = typed.payload?.cursor;
+            const listInput: Record<string, unknown> = { blockToken: rawToken, limit };
+            if (typeof prefix === 'string') listInput.prefix = prefix;
+            if (typeof cursor === 'string') listInput.cursor = cursor;
+            void callTrpcData('apps.storage.list', listInput, 'GET').then((r) => {
+              if (r.error) {
+                dispatchToBlock({
+                  type: 'APP_STORAGE_LIST_RESULT',
+                  payload: { requestId: requestId ?? '', keys: [], error: r.error },
+                });
+                return;
+              }
+              const rawKeys = (r.data as { keys?: unknown })?.keys;
+              const keys = (Array.isArray(rawKeys) ? rawKeys : []).map((k) => {
+                const entry = k as { key?: unknown; updatedAt?: unknown };
+                return {
+                  key: String(entry.key),
+                  updatedAt:
+                    entry.updatedAt instanceof Date
+                      ? entry.updatedAt.toISOString()
+                      : String(entry.updatedAt),
+                };
+              });
+              const nextCursor = (r.data as { nextCursor?: unknown })?.nextCursor;
+              dispatchToBlock({
+                type: 'APP_STORAGE_LIST_RESULT',
+                payload: {
+                  requestId: requestId ?? '',
+                  keys,
+                  ...(typeof nextCursor === 'string' && nextCursor.length > 0
+                    ? { nextCursor }
+                    : {}),
+                },
+              });
+            });
+            return;
+          }
+
+          case 'APP_STORAGE_QUOTA': {
+            // Query apps.storage.getQuota {blockToken} (GET).
+            void callTrpcData('apps.storage.getQuota', { blockToken: rawToken }, 'GET').then(
+              (r) => {
+                if (r.error) {
+                  dispatchToBlock({
+                    type: 'APP_STORAGE_QUOTA_RESULT',
+                    payload: {
+                      requestId: requestId ?? '',
+                      usedBytes: 0,
+                      rowCount: 0,
+                      limitBytes: 0,
+                      limitRows: 0,
+                      error: r.error,
+                    },
+                  });
+                  return;
+                }
+                const d = r.data as {
+                  usedBytes?: unknown;
+                  rowCount?: unknown;
+                  limitBytes?: unknown;
+                  limitRows?: unknown;
+                };
+                const num = (v: unknown) => (typeof v === 'number' ? v : 0);
+                dispatchToBlock({
+                  type: 'APP_STORAGE_QUOTA_RESULT',
+                  payload: {
+                    requestId: requestId ?? '',
+                    usedBytes: num(d?.usedBytes),
+                    rowCount: num(d?.rowCount),
+                    limitBytes: num(d?.limitBytes),
+                    limitRows: num(d?.limitRows),
+                  },
+                });
+              },
+            );
+            return;
+          }
+
+          // ---- SHARED (cross-user, votable) storage ----
+          // FORWARD the eight `SHARED_*` bridges to the block-token
+          // `apps.shared.{list,getCount,getCounts,append,update,vote,unvote,
+          // withdraw}` procedures (reads GET, mutations POST — FLAT
+          // `{ blockToken, … }` input, same convention as apps.storage.*). Reads
+          // need the `apps:storage:shared:read` scope, writes
+          // `apps:storage:shared:write`; the dev token carries whatever the local
+          // manifest declared and the server enforces. Without these,
+          // `useSharedStorage()` hung to its 30s timeout in dev:live.
+          case 'SHARED_LIST': {
+            const rawLimit = typed.payload?.limit;
+            const limit =
+              typeof rawLimit === 'number'
+                ? Math.min(Math.max(Math.floor(rawLimit), 1), 100)
+                : 50;
+            const listInput: Record<string, unknown> = { blockToken: rawToken, limit };
+            if (typeof typed.payload?.prefix === 'string') listInput.prefix = typed.payload.prefix;
+            if (typeof typed.payload?.cursor === 'string') listInput.cursor = typed.payload.cursor;
+            void callTrpcData('apps.shared.list', listInput, 'GET').then((r) => {
+              if (r.error) {
+                dispatchToBlock({
+                  type: 'SHARED_LIST_RESULT',
+                  payload: { requestId: requestId ?? '', items: [], error: r.error },
+                });
+                return;
+              }
+              const rawItems = (r.data as { items?: unknown })?.items;
+              const items = (Array.isArray(rawItems) ? rawItems : []).map(sharedItemWireFrom);
+              const nextCursor = (r.data as { nextCursor?: unknown })?.nextCursor;
+              dispatchToBlock({
+                type: 'SHARED_LIST_RESULT',
+                payload: {
+                  requestId: requestId ?? '',
+                  items,
+                  ...(typeof nextCursor === 'string' && nextCursor.length > 0
+                    ? { nextCursor }
+                    : {}),
+                },
+              });
+            });
+            return;
+          }
+
+          case 'SHARED_GET_COUNT': {
+            const key = typed.payload?.key ?? '';
+            void callTrpcData('apps.shared.getCount', { blockToken: rawToken, key }, 'GET').then(
+              (r) => {
+                if (r.error) {
+                  dispatchToBlock({
+                    type: 'SHARED_GET_COUNT_RESULT',
+                    payload: { requestId: requestId ?? '', count: 0, error: r.error },
+                  });
+                  return;
+                }
+                const count = (r.data as { count?: unknown })?.count;
+                dispatchToBlock({
+                  type: 'SHARED_GET_COUNT_RESULT',
+                  payload: { requestId: requestId ?? '', count: typeof count === 'number' ? count : 0 },
+                });
+              },
+            );
+            return;
+          }
+
+          case 'SHARED_GET_COUNTS': {
+            const keys = Array.isArray(typed.payload?.keys) ? typed.payload.keys : [];
+            void callTrpcData(
+              'apps.shared.getCounts',
+              { blockToken: rawToken, keys },
+              'GET',
+            ).then((r) => {
+              if (r.error) {
+                dispatchToBlock({
+                  type: 'SHARED_GET_COUNTS_RESULT',
+                  payload: { requestId: requestId ?? '', counts: {}, error: r.error },
+                });
+                return;
+              }
+              const counts = (r.data as { counts?: unknown })?.counts;
+              dispatchToBlock({
+                type: 'SHARED_GET_COUNTS_RESULT',
+                payload: {
+                  requestId: requestId ?? '',
+                  counts: (counts && typeof counts === 'object' ? counts : {}) as Record<
+                    string,
+                    number
+                  >,
+                },
+              });
+            });
+            return;
+          }
+
+          case 'SHARED_GET': {
+            // SERVED, not refused (#386): this is the single-row companion to
+            // SHARED_LIST's paged read and forwards to the SAME block-token
+            // procedure family the other eight `SHARED_*` bridges already use.
+            // Nothing about it needs host chrome or a session — so refusing it
+            // would be a limitation this host does not actually have.
+            //
+            // Before this case existed the message fell through `default:
+            // return` with NO reply, so `useSharedStorage().get(key)` sat for
+            // the full 30s protocol timeout and then threw a generic
+            // RequestTimeoutError — while the identical call resolved under
+            // dev:mock.
+            //
+            // `item: null` on a miss (never an error): the protocol makes a
+            // missing / hidden / withdrawn row resolve cleanly to "not found"
+            // so a `?g=` deep-link to a moderated row cannot distinguish it
+            // from an absent one. Only a HOST-SIDE failure sets `error`.
+            const key = typed.payload?.key ?? '';
+            void callTrpcData('apps.shared.get', { blockToken: rawToken, key }, 'GET').then((r) => {
+              if (r.error) {
+                dispatchToBlock({
+                  type: 'SHARED_GET_RESULT',
+                  payload: { requestId: requestId ?? '', item: null, error: r.error },
+                });
+                return;
+              }
+              // ENVELOPE-LENIENT. The sibling reads are not consistent about
+              // this — `getCount` returns `{ count }` and `list` returns
+              // `{ items }`, but `withdraw` returns the bare `{ deleted }` —
+              // and an envelope guess that is wrong would turn every hit into
+              // a silent `null`, i.e. "the row does not exist" for a row that
+              // does. So accept `{ item: <row> }` OR the bare row, identified
+              // by carrying a `key`. Anything else is a genuine miss.
+              const data = r.data as { item?: unknown; key?: unknown } | null | undefined;
+              const envelope = data?.item;
+              const rawItem =
+                envelope && typeof envelope === 'object'
+                  ? envelope
+                  : data && typeof data.key === 'string'
+                    ? data
+                    : null;
+              dispatchToBlock({
+                type: 'SHARED_GET_RESULT',
+                payload: {
+                  requestId: requestId ?? '',
+                  item: rawItem ? sharedItemWireFrom(rawItem) : null,
+                },
+              });
+            });
+            return;
+          }
+
+          case 'SHARED_APPEND': {
+            const value = typed.payload?.value;
+            void callTrpcData(
+              'apps.shared.append',
+              { blockToken: rawToken, value },
+              'POST',
+            ).then((r) => {
+              if (r.error) {
+                dispatchToBlock({
+                  type: 'SHARED_APPEND_RESULT',
+                  payload: { requestId: requestId ?? '', key: '', error: r.error },
+                });
+                return;
+              }
+              const key = (r.data as { key?: unknown })?.key;
+              dispatchToBlock({
+                type: 'SHARED_APPEND_RESULT',
+                payload: { requestId: requestId ?? '', key: String(key ?? '') },
+              });
+            });
+            return;
+          }
+
+          case 'SHARED_UPDATE': {
+            const key = typed.payload?.key ?? '';
+            const value = typed.payload?.value;
+            void callTrpcData(
+              'apps.shared.update',
+              { blockToken: rawToken, key, value },
+              'POST',
+            ).then((r) => {
+              dispatchToBlock({
+                type: 'SHARED_UPDATE_RESULT',
+                payload: r.error
+                  ? { requestId: requestId ?? '', ok: false, error: r.error }
+                  : { requestId: requestId ?? '', ok: true },
+              });
+            });
+            return;
+          }
+
+          case 'SHARED_VOTE': {
+            const key = typed.payload?.key ?? '';
+            void callTrpcData('apps.shared.vote', { blockToken: rawToken, key }, 'POST').then(
+              (r) => {
+                if (r.error) {
+                  dispatchToBlock({
+                    type: 'SHARED_VOTE_RESULT',
+                    payload: { requestId: requestId ?? '', count: 0, error: r.error },
+                  });
+                  return;
+                }
+                const count = (r.data as { count?: unknown })?.count;
+                dispatchToBlock({
+                  type: 'SHARED_VOTE_RESULT',
+                  payload: { requestId: requestId ?? '', count: typeof count === 'number' ? count : 0 },
+                });
+              },
+            );
+            return;
+          }
+
+          case 'SHARED_UNVOTE': {
+            const key = typed.payload?.key ?? '';
+            void callTrpcData('apps.shared.unvote', { blockToken: rawToken, key }, 'POST').then(
+              (r) => {
+                if (r.error) {
+                  dispatchToBlock({
+                    type: 'SHARED_UNVOTE_RESULT',
+                    payload: { requestId: requestId ?? '', count: 0, error: r.error },
+                  });
+                  return;
+                }
+                const count = (r.data as { count?: unknown })?.count;
+                dispatchToBlock({
+                  type: 'SHARED_UNVOTE_RESULT',
+                  payload: { requestId: requestId ?? '', count: typeof count === 'number' ? count : 0 },
+                });
+              },
+            );
+            return;
+          }
+
+          case 'SHARED_WITHDRAW': {
+            const key = typed.payload?.key ?? '';
+            void callTrpcData('apps.shared.withdraw', { blockToken: rawToken, key }, 'POST').then(
+              (r) => {
+                if (r.error) {
+                  dispatchToBlock({
+                    type: 'SHARED_WITHDRAW_RESULT',
+                    payload: {
+                      requestId: requestId ?? '',
+                      ok: false,
+                      deleted: false,
+                      error: r.error,
+                    },
+                  });
+                  return;
+                }
+                dispatchToBlock({
+                  type: 'SHARED_WITHDRAW_RESULT',
+                  payload: {
+                    requestId: requestId ?? '',
+                    ok: true,
+                    deleted: Boolean((r.data as { deleted?: unknown })?.deleted),
+                  },
+                });
+              },
+            );
+            return;
+          }
+
+          case 'SHARED_REPORT': {
+            // SERVED, not refused (#386): same block-token procedure family as
+            // the other `SHARED_*` bridges — the trust gate and the rate limit
+            // are SERVER-side, so forwarding here exercises the real bounds
+            // rather than a local imitation of them. Nothing needs host chrome.
+            //
+            // Before this case existed the message fell through `default:
+            // return` with NO reply, so `useSharedStorage().report(key, reason)`
+            // sat for the full 30s protocol timeout.
+            //
+            // `reason` is OPTIONAL free text — forwarded only when the block
+            // actually sent a string, so an omitted reason stays omitted rather
+            // than becoming `''` (the server bounds it either way).
+            const key = typed.payload?.key ?? '';
+            const reportInput: Record<string, unknown> = { blockToken: rawToken, key };
+            if (typeof typed.payload?.reason === 'string') {
+              reportInput.reason = typed.payload.reason;
+            }
+            void callTrpcData('apps.shared.report', reportInput, 'POST').then((r) => {
+              dispatchToBlock({
+                type: 'SHARED_REPORT_RESULT',
+                payload: r.error
+                  ? { requestId: requestId ?? '', ok: false, error: r.error }
+                  : { requestId: requestId ?? '', ok: true },
+              });
+            });
+            return;
+          }
+
+          case 'SAVE_IMAGE': {
+            // 🔴 REFUSED, and refusing is the POINT — the same reasoning as
+            // CREATE_POST_FROM_APP above, one step stronger.
+            //
+            // The real bridge is a SECURITY boundary, not a convenience: the
+            // host fetches the blob in its UNSANDBOXED top frame, and the two
+            // request variants are gated differently.
+            //   • `url` — the host ALLOWLISTS the origin to the civitai
+            //     image/blob CDN and REFUSES an arbitrary host, because an
+            //     unverified block's `url` is untrusted input to a host-side
+            //     fetch.
+            //   • `imageId` — the host resolves it through the SAME per-viewer
+            //     gated read that backs GET_IMAGES_BY_IDS, so a withheld or
+            //     above-ceiling image can never be coerced into a download.
+            //   • `bytes` (#583) — refused here too. Its gate (content
+            //     classification, the cap) is reproducible, and `createMockHost`
+            //     reproduces it; but a dev:live "download" would be this
+            //     harness's tab saving a file, which proves nothing about the
+            //     production host's page-only rule or its top-frame download.
+            //     One honest refusal for every variant keeps this branch simple.
+            //
+            // This harness has NEITHER of the url / imageId gates. The allowlist is the production
+            // host's, not this SDK's — there is no origin set here to check
+            // against — so a dev-side "download it anyway" would accept URLs
+            // production refuses and let a block ship having never once handled
+            // the refusal. Inventing a divergent allowlist is worse than having
+            // none: it would be a security posture nobody reviewed, only ever
+            // exercised in dev.
+            //
+            // So: an honest, IMMEDIATE refusal on the type's own channel rather
+            // than the silent 30s hang this case replaces (#386). FREE TEXT,
+            // not a host code — `SAVE_IMAGE_RESULT.error` is an open string and
+            // `useSaveImage()` surfaces it verbatim; none of the host's real
+            // failure strings ("disallowed origin", "hidden") would be true
+            // here. Use dev:mock to exercise the resolve path, and the real
+            // site to exercise the gates.
+            if (!isRoutableRequestId(requestId)) return;
+            logOnce(
+              'save-image',
+              'SAVE_IMAGE is not supported in dev:live (the download bridge is the production ' +
+                "host's unsandboxed top frame plus its CDN origin allowlist / gated per-viewer " +
+                'read — neither of which this harness has). Replying with a refusal. Use dev:mock ' +
+                'to exercise the save path.',
+            );
+            dispatchToBlock({
+              type: 'SAVE_IMAGE_RESULT',
+              payload: {
+                requestId,
+                ok: false,
+                error: 'saving images is not supported in dev:live — use dev:mock',
+              },
+            });
+            return;
+          }
+
+          case 'NAVIGATE': {
+            // 🔴 THIS HANDLER USED TO SEND EVERY PATH TO THE REAL SITE, AND THAT
+            // IS WHY `dev:live` AND PRODUCTION DISAGREED. It resolved any
+            // relative path against `baseUrl` — "so an in-app path
+            // (`/models/123`) opens on the real site" — while production
+            // resolved the same call under the block's OWN route. So the docs
+            // and the dev harness agreed with each other and production was the
+            // odd one out, which is exactly the shape that makes a platform bug
+            // look like a block bug (civitai#5209).
+            //
+            // It now mirrors the merged contract, DEFAULT INCLUDED:
+            //   scope absent / anything but 'site'  → APP space (this dev origin)
+            //   scope === 'site'                    → SITE space (`baseUrl`)
+            // compared against the literal 'site' rather than validated against
+            // the union, so an unknown value fails CLOSED onto the narrower
+            // space — byte-for-byte the host's own test.
+            //
+            // 🔴 WHAT IS DELIBERATELY *NOT* MIRRORED: the host's hostile-path
+            // battery (control characters, backslashes, `%2f`/`%5c`,
+            // the resolved-vs-sent segment-structure rule, app containment).
+            // Those guard an UNTRUSTED iframe. In `dev:live` there is no
+            // untrusted party — the developer's own code, their own dev token,
+            // their own browser — so copying ~200 lines of security-critical
+            // resolver here would buy no safety and create a second, non-
+            // authoritative copy of it to drift. What IS mirrored is the
+            // CONTRACT a block author can be honestly wrong about: which space
+            // a path lands in, the `'app'` default, and the two refusals the
+            // published docs promise (a scheme, and `/api/*` in site scope).
+            const payload = typed.payload ?? {};
+            const rawPath = typeof payload.path === 'string' ? payload.path : '';
+            const target = payload.target ?? 'current';
+            const scope = payload.scope === 'site' ? 'site' : 'app';
+
+            // A scheme or protocol-relative reference is refused by the host in
+            // BOTH scopes — a block cannot move the host to another origin. This
+            // harness used to pass an absolute URL straight through, so a
+            // `navigate('https://example.com/x')` that production DROPS worked
+            // here. Refuse it, and say so: a silent drop in a dev harness is the
+            // thing a dev then blames on their own code.
+            if (/^[a-zA-Z][a-zA-Z0-9+.\-]*:/.test(rawPath) || /^\/[/\\]/.test(rawPath)) {
+              logOnce(
+                'navigate-off-origin',
+                `NAVIGATE to ${JSON.stringify(rawPath)} was DROPPED: the host refuses any scheme ` +
+                  'or protocol-relative path, in either scope. Pass a path within a scope ' +
+                  "(`navigate('models/123', { scope: 'site' })`) instead of a full URL.",
+              );
+              return;
+            }
+
+            // Leading slashes are normalised away in BOTH scopes — `scope`
+            // already said which space this is, so the slash has nothing left to
+            // mean. Do not reintroduce punctuation semantics here.
+            const path = rawPath.replace(/^\/+/, '');
+
+            if (scope === 'site') {
+              // The host's one content-based refusal: `/api/*` is not a page
+              // route, and `/api/auth/logout` takes a bare GET. Kept here because
+              // it is part of the PUBLISHED contract, not because this harness is
+              // a security boundary — a dev who hits it in production should hit
+              // it in `dev:live` too.
+              //
+              // 🔴 BY DECODED VALUE, LIKE THE HOST — not by spelling. An earlier
+              // revision compared `path.split('/')[0]` raw and said so in a
+              // comment, which left `%61pi/auth/logout` refused in production and
+              // followed here: the published contract mirrored with the one input
+              // shape that defeats it. Deleting the branch instead was the other
+              // coherent option and was rejected — the refusal is part of the
+              // PUBLISHED contract (not of any security boundary this harness
+              // pretends to be), so a dev who hits it in production should hit it
+              // in `dev:live` too, and a mirror that is wrong for one input is
+              // worse than either having it or not.
+              //
+              // This is NOT the host's "two spellings of one rule" case, which
+              // deleted a `first.toLowerCase() === 'api'` fast path sitting
+              // ALONGSIDE the decoded comparison and provably unable to reach a
+              // verdict the survivor did not (`decodeURIComponent('api')` is
+              // `'api'`; a mutation run showed it SURVIVED every test). There was
+              // only ever one comparison here, and it was the wrong one.
+              //
+              // Both of the host's refusal channels, in its order
+              // (`navigateSiteFirstSegmentIsRefused`): a first segment whose
+              // meaning cannot be established — a malformed escape like `%zz` —
+              // is refused too, because an undecodable segment is not evidence
+              // that it is not `api`. Fails CLOSED, like the host.
+              if (navigateSiteFirstSegmentIsRefused(path)) {
+                logOnce(
+                  'navigate-api',
+                  `NAVIGATE to ${JSON.stringify(rawPath)} was DROPPED: in site scope the host ` +
+                    'refuses a first segment that decodes to `api`, and refuses one it cannot ' +
+                    'decode at all. Only page routes are reachable.',
+                );
+                return;
+              }
+              try {
+                const url = `${baseUrl}/${path}`;
+                if (target === 'new_tab') {
+                  win.open(url, '_blank');
+                } else {
+                  win.location.assign(url);
+                }
+              } catch {
+                /* navigation may be unavailable (tests) */
+              }
+              return;
+            }
+
+            // APP scope. Production resolves this under `<base>/<slug>/<path>`
+            // and pushes it SHALLOWLY, keeping the page mounted. In `dev:live`
+            // the block IS the page, served at this dev origin's own root, so the
+            // faithful analogue is `/<path>` on THIS origin — and `pushState`
+            // rather than `assign`, because a full load is precisely what
+            // "shallow" excludes.
+            //
+            // 🔴 `reflectRoute` IS WHAT MAKES IT WORK rather than merely move the
+            // URL bar — and it is the production channel, not a local analogue
+            // of one. Production reflects the new sub-path back into the block
+            // over `ROUTE_CHANGED`; so does this now. An earlier revision
+            // dispatched a synthetic `popstate` here instead, "since this SDK
+            // models no `ROUTE_CHANGED`" — which made a history router re-render
+            // HERE and nowhere else, because no production host dispatches a
+            // `popstate` for its own shallow push. That is the #5209 failure
+            // class with its sign flipped, and a dev harness that is kinder than
+            // production is how #5209 stayed invisible in the first place.
+            //
+            // Emitted only in the `current` arm: a `new_tab` navigation does not
+            // move THIS frame's route, and the host's effect is keyed on the
+            // sub-path of the page it is actually rendering.
+            try {
+              const url = `${win.location.origin}/${path}`;
+              if (target === 'new_tab') {
+                win.open(url, '_blank');
+              } else {
+                win.history.pushState(null, '', url);
+                reflectRoute(path);
+              }
+            } catch {
+              /* history/navigation may be unavailable (tests) */
+            }
+            return;
+          }
+
+          case 'REQUEST_CONSENT': {
+            // Live mode CANNOT grant consent: there is no host UI to open and no
+            // way to re-mint a token with a scope it doesn't carry. If the token
+            // already has the budgeted scope, the block never gets here (its
+            // `granted` is true) — so reaching this case means the token is
+            // read-only (typically an OAuth-minted token) and Generate would
+            // otherwise dead-end SILENTLY. Log a clear, actionable error rather
+            // than swallowing it. (The startup warning above already fired once.)
+            logOnce(
+              'request-consent',
+              'REQUEST_CONSENT received but live mode cannot grant scopes. Your dev token lacks ' +
+                '`ai:write:budgeted`, so Generate will not spend. Re-mint with a full-scope personal ' +
+                'API key: `civitai login --token <key>` (https://civitai.com/user/account), then ' +
+                'update VITE_LIVE_BLOCK_TOKEN and restart.',
+            );
+            // 🔴 TELL THE BLOCK, not only the console. The `logOnce` above lands
+            // in the DEV's devtools; the block's own UI sees nothing and goes on
+            // rendering "confirm in the Civitai dialog" for a grant that can
+            // never arrive. That is the exact contradiction the production host
+            // now closes with `CONSENT_UNAVAILABLE` (civitai #3733), so live mode
+            // sends it too — otherwise a refusal handler written against prod is
+            // unreachable in `pnpm dev:live` and only observable in production.
+            //
+            // ADDITIVE: the log is unchanged and still unconditional (live mode
+            // genuinely cannot grant, whatever was asked for). Only the PUSH is
+            // gated, on the same rule the host applies — so a block that merely
+            // re-requests a scope its token ALREADY carries gets silence, not a
+            // permission-unavailable state over a permission that works.
+            //
+            // The grantable set is `[]`: there is no consent UI to open and no
+            // way to re-mint a token with a scope it does not carry, so NOTHING
+            // is grantable here, ever.
+            {
+              const notice = resolveUngrantableConsentNotice(
+                (typed.payload as unknown as { scopes?: unknown } | undefined)?.scopes,
+                Array.isArray(decoded.scopes) ? decoded.scopes : [],
+                [],
+              );
+              if (notice.notify) {
+                dispatchToBlock({
+                  type: 'CONSENT_UNAVAILABLE',
+                  payload: consentUnavailablePayload(notice),
+                });
+              }
+            }
+            return;
+          }
+
+          case 'TRACK_EVENT':
+          case 'REQUEST_SIGN_IN':
+          case 'BLOCK_ERROR':
+            // No-op. TRACK_EVENT/BLOCK_ERROR are fire-and-forget; REQUEST_SIGN_IN
+            // can't open a login in dev (the viewer comes from the token — a
+            // failed viewer fetch already warns in resolveViewer).
+            return;
+
+          default:
+            return;
+        }
+      },
+    };
+
+    Object.defineProperty(win, 'parent', {
+      value: parentMock,
+      configurable: true,
+      writable: true,
+    });
+
+    // Defer one tick so the block's transport listener is registered before
+    // BLOCK_INIT fires (mirrors the mock host). The viewer fetch is async; the
+    // init lands when it resolves.
+    after(0, () => {
+      void dispatchInit();
+    });
+
+    teardown = () => {
+      if (torn) return;
+      torn = true;
+      installed = false;
+      pushToBlock = null;
+      // Symmetric with the `addEventListener` in `install` — a listener that
+      // outlived the host would keep pushing `ROUTE_CHANGED` at a block whose
+      // host is gone (and, across a re-install, from two hosts at once).
+      win.removeEventListener('popstate', onPopState);
+      // The next install re-dispatches BLOCK_INIT and re-seeds the route from
+      // its context, so neither piece of route state may survive this teardown.
+      initDispatched = false;
+      currentSubPath = '';
+      for (const t of timers) clearTimeout(t);
+      timers.clear();
+      // Close any open picker overlay (unmounts its DOM; resolves it `null`).
+      for (const overlay of openOverlays) overlay.close();
+      openOverlays.clear();
+      Object.defineProperty(win, 'parent', {
+        value: originalParent,
+        configurable: true,
+        writable: true,
+      });
+    };
+    return teardown;
+  }
+
+  // `setScenario` / `buzz` are inert in live mode — there are no synthetic
+  // scenarios (the backend is the source of truth). Kept so the returned object
+  // is interchangeable with a `createMockHost` handle.
+  const buzzHandle: MockBuzzHandle = {
+    getBalance: () => undefined,
+    setBalance: () => {
+      /* no-op in live mode */
+    },
+  };
+
+  return {
+    install,
+    setScenario: (_patch: MockHostScenarioPatch) => {
+      /* no-op in live mode */
+    },
+    // NOT a no-op (unlike setScenario/buzz): the theme is a real, host-owned
+    // value the live host genuinely controls, so flipping it pushes a real
+    // THEME_CHANGE. Skips a redundant push when the value didn't change,
+    // matching the real host's changed-value-only effect.
+    setTheme: (next: Theme) => {
+      if (currentTheme === next) return;
+      currentTheme = next;
+      pushToBlock?.({ type: 'THEME_CHANGE', payload: { theme: next } });
+    },
+    buzz: buzzHandle,
+  };
+}
+
+/**
+ * A minimal anon-ish viewer used when `/api/v1/blocks/me` can't be reached.
+ *
+ * Carries EXACTLY `{ id, username, signedIn }` — byte-for-byte the key set the
+ * real host puts on the wire:
+ *
+ *  - NO `status`. The platform withholds the viewer's moderation state from
+ *    third-party iframes (civitai #2521), so a dev host that sent it would
+ *    invite a block to read a field production never provides.
+ *  - WITH `signedIn: true`. civitai/civitai `main`'s `withSignedInFlag`
+ *    (`src/components/AppBlocks/projectBlockInit.ts`) stamps it on every
+ *    present viewer from BOTH host surfaces, and that repo's
+ *    `__tests__/projectBlockInit.test.ts` pins the viewer key set as exactly
+ *    `['id', 'signedIn', 'username']`.
+ *
+ * 🔴 THE PROPERTY THIS FENCE HOLDS: the dev hosts must not be more generous
+ * than the host they imitate — this default MATCHES the host, it does not run
+ * ahead of it. See `DEFAULT_VIEWER` in `mockHost` for the same note.
+ */
+function anonFallbackViewer(): ViewerInfo {
+  return { id: 0, username: 'dev-live', signedIn: true };
+}
+
+/**
+ * SITE-scope refusal on a path's FIRST segment, by DECODED value — the dev-host
+ * mirror of the host's own `navigateSiteFirstSegmentIsRefused`
+ * (civitai/civitai `src/components/AppBlocks/pageBlockHostLogic.ts`).
+ *
+ * `path` arrives already stripped of leading slashes by the caller, so segment 0
+ * is `path.split('/')[0]`.
+ *
+ * TWO CHANNELS, and the second is the reason the host named the function
+ * "…IsRefused" rather than "…IsApi":
+ *  1. the segment DECODES to `api` (case-insensitively) — the `/api/*` rule the
+ *     published docs promise, which `%61pi` must not evade;
+ *  2. the segment cannot be decoded at all (`%zz`, a bare `%`) — its meaning
+ *     cannot be established, so it is not pushed. A deliberate fail-closed
+ *     decision, and it means this returns `true` for a segment that is not `api`.
+ *
+ * ⚠️ IT IS THE CONTRACT MIRROR, NOT A SECURITY BOUNDARY. The host's hostile-path
+ * battery (control characters, backslashes, `%2f`/`%5c`, the resolved-vs-sent
+ * segment-structure rule, app containment) is deliberately NOT mirrored in this
+ * harness — see the `NAVIGATE` case — so unlike the host, this cannot rely on
+ * `%2f` already being refused and a decode here CAN introduce a separator
+ * (`a%2fb` decodes to `a/b`). That costs nothing for the question being asked:
+ * only whether segment 0 means `api`, and a decode that produces a separator
+ * cannot turn a non-`api` segment into an `api` one.
+ */
+function navigateSiteFirstSegmentIsRefused(path: string): boolean {
+  const first = path.split('/')[0] ?? '';
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(first);
+  } catch {
+    return true;
+  }
+  return decoded.toLowerCase() === 'api';
+}
+
+/**
+ * Extract the `snapshot` from a tRPC response. Handles the superjson
+ * `{ result: { data: { json: T } } }` envelope AND the transformer-less
+ * `{ result: { data: T } }` shape, defensively (mirrors `fetchBuzzAccount`).
+ */
+function extractSnapshot(parsed: unknown): BlockWorkflowSnapshot | undefined {
+  if (typeof parsed !== 'object' || parsed === null) return undefined;
+  const result = (parsed as { result?: { data?: unknown } }).result;
+  const data = result?.data;
+  if (data == null) return undefined;
+  // superjson: { json: { snapshot } } ; plain: { snapshot }
+  const unwrapped =
+    typeof data === 'object' && data !== null && 'json' in data
+      ? (data as { json?: unknown }).json
+      : data;
+  if (typeof unwrapped !== 'object' || unwrapped === null) return undefined;
+  const snapshot = (unwrapped as { snapshot?: unknown }).snapshot;
+  if (typeof snapshot !== 'object' || snapshot === null) return undefined;
+  return snapshot as BlockWorkflowSnapshot;
+}
+
+/**
+ * Extract the UNWRAPPED data object from a tRPC response — the generalization of
+ * {@link extractSnapshot} for procedures that return a plain record (storage /
+ * settings) rather than a `{ snapshot }` wrapper. Handles the superjson
+ * `{ result: { data: { json: T } } }` envelope AND the transformer-less
+ * `{ result: { data: T } }` shape. Returns `undefined` only when there is no
+ * `result.data` at all (a genuinely malformed response); a procedure that
+ * legitimately returns `null`/`{}` round-trips as that value.
+ */
+function extractData(parsed: unknown): unknown {
+  if (typeof parsed !== 'object' || parsed === null) return undefined;
+  const result = (parsed as { result?: { data?: unknown } }).result;
+  const data = result?.data;
+  if (data === undefined || data === null) return undefined;
+  // superjson: { json: <T> } ; plain: <T>
+  return typeof data === 'object' && data !== null && 'json' in data
+    ? (data as { json?: unknown }).json
+    : data;
+}
+
+/**
+ * Extract a human-readable error message from a tRPC error response. tRPC v11
+ * error bodies are `{ error: { json: { message } } }` (superjson) or
+ * `{ error: { message } }`. Returns undefined when no message is found.
+ */
+function extractTrpcError(parsed: unknown): string | undefined {
+  if (typeof parsed !== 'object' || parsed === null) return undefined;
+  const error = (parsed as { error?: unknown }).error;
+  if (typeof error !== 'object' || error === null) return undefined;
+  const inner =
+    'json' in error ? (error as { json?: unknown }).json : (error as Record<string, unknown>);
+  if (typeof inner !== 'object' || inner === null) return undefined;
+  const message = (inner as { message?: unknown }).message;
+  return typeof message === 'string' ? message : undefined;
+}
