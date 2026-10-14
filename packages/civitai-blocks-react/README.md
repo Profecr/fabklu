@@ -1,0 +1,1614 @@
+# `@civitai/blocks-react`
+
+React hooks and iframe transport for [Civitai Apps](https://github.com/civitai/civitai-app-starters/blob/main/docs/build-your-first-app-block.md).
+
+Pairs with [`@civitai/app-sdk`](https://www.npmjs.com/package/@civitai/app-sdk)'s
+`/blocks` subpath, which carries the framework-agnostic manifest, scope, and
+`postMessage` contract. This package adds the transport that actually moves bytes
+and the React hooks block authors call.
+
+## Install
+
+```bash
+pnpm add @civitai/blocks-react @civitai/app-sdk react
+```
+
+`react` and `@civitai/app-sdk` are peer dependencies — bring them yourself so
+your block app and the SDK share a single React tree.
+
+## Quick start
+
+> **Building a UI?** The `/ui` subexport ships a drop-in, Civitai-themed
+> component pack (Button, TextInput, Textarea, Card, Stack, Group, Alert, Loader,
+> Badge, Modal + `injectBlocksStyles`) — zero CSS setup, auto-themed via your
+> block's `data-theme`. See [The `/ui` subexport](#the-ui-subexport).
+
+```tsx
+import { useRef } from 'react';
+import { useBlockContext, useBlockResize, useBuzzWorkflow } from '@civitai/blocks-react';
+import { Button } from '@civitai/blocks-react/ui';
+import { isModelSlotContext, isSignedIn } from '@civitai/app-sdk/blocks';
+
+export function App() {
+  const { ready, context, viewer, theme } = useBlockContext();
+  const { submit, status, result } = useBuzzWorkflow();
+  const rootRef = useRef<HTMLDivElement>(null);
+  useBlockResize(rootRef);                 // host fits the iframe to content
+
+  // No ref on the pre-init skeleton — useBlockResize observes the real root
+  // whenever it mounts, including on a later render.
+  if (!ready) return <div>Loading…</div>;
+  // `context` is a union keyed on slotId — narrow with the guard, not a cast.
+  if (!isModelSlotContext(context)) return <div ref={rootRef}>Wrong slot.</div>;
+
+  return (
+    // GOTCHA #60: set data-theme on YOUR OWN root — the host can't reach into
+    // the iframe to set it. Without this any [data-theme="dark"] CSS is dormant.
+    <div ref={rootRef} data-theme={theme}>
+      {/* Sign-in gate: call `isSignedIn`, never an identity read. */}
+      <p>Block for model {context.modelName} ({isSignedIn(viewer) ? 'signed in' : 'anon'})</p>
+      {/* `/ui` Button — themed by the data-theme above; `loading` disables + shows a spinner */}
+      <Button
+        loading={status === 'submitting' || status === 'polling'}
+        onClick={() =>
+          submit({
+            kind: 'textToImage',
+            modelId: context.modelId,
+            modelVersionId: context.modelVersionId,
+            params: { prompt: 'a cat' },
+          })
+        }
+      >
+        Generate
+      </Button>
+      {status === 'done' && result?.imageUrls?.map((u) => <img key={u} src={u} />)}
+    </div>
+  );
+}
+```
+
+> `submit` takes a full `WorkflowBody` (`{ kind, modelId, modelVersionId, params }`),
+> **not** `{ prompt }`. Both ids come from `useBlockContext().context` narrowed to
+> `ModelSlotContext`.
+
+## Web storage works, even sandboxed
+
+Block iframes have no `allow-same-origin`, so the document runs at an **opaque
+origin** where even *reading* `localStorage` throws a `SecurityError` — most
+often from a third-party dependency you can't guard from the outside, which then
+reports it as something else entirely.
+
+Importing `@civitai/blocks-react` installs the SDK's in-memory `Storage`
+fallback over `localStorage` / `sessionStorage` when — and only when — a
+round-trip probe shows they're broken. Working storage is left untouched, and
+nothing is fabricated in Node/SSR. You don't have to do anything.
+
+The one case that needs your help: a dependency that reads storage **while its
+module evaluates**, imported ahead of this package. Import statements are
+hoisted above every statement, so put the shim's side-effect import first in
+your entry file:
+
+```ts
+import '@civitai/app-sdk/safe-storage';
+```
+
+Full rules + the `installSafeStorage()` / `createMemoryStorage()` API:
+[`@civitai/app-sdk` README → Web storage in a block](https://github.com/civitai/civitai-app-starters/tree/main/packages/civitai-app-sdk#web-storage-in-a-block-civitaiapp-sdksafe-storage).
+Remember the fallback is session-scoped — use [`useAppStorage()`](#useappstorage)
+for anything durable.
+
+## The hooks
+
+All hooks build on a singleton transport, so they're safe to call from any
+component without prop-drilling. Every hook with a section below gets one
+minimal snippet — but the sections are **not** the full export surface, so treat
+the package's type declarations (IDE hover / autocomplete on the package root) as
+the authoritative list of what exists.
+
+Exported from the package root with no snippet in this section, as of this
+writing: `useGatedImages()`, `usePublishGenerationOutputs()`, `useSaveImage()`,
+`useTip()` and `useTipAllowance()` — for the tip pair, the
+[`TipButton`](#the-ui-subexport) row documents the intended usage and the
+allowance-sharing rule. `useDirectLoad()` is covered under
+[Direct-load fallback](#direct-load-fallback-open-on-civitai) rather than here.
+
+### `useBlockContext()`
+
+The primary hook. Returns everything the host delivered in `BLOCK_INIT` plus a
+`ready` gate — fields are sentinel-empty before init, so gate your UI on `ready`.
+
+```tsx
+const { ready, context, viewer, theme, settings, blockId, blockInstanceId, appId, token, renderMode } =
+  useBlockContext();
+```
+
+- `context` — `BlockContext` (`{ slotId, … }`); narrow to `ModelSlotContext` for
+  model-page slots.
+- `viewer` — `ViewerInfo | null` (`null` = anonymous). **Gate sign-in with
+  `isSignedIn(viewer)`** (from `@civitai/app-sdk/blocks`), never on
+  `viewer.id`/`viewer.username` (both `@deprecated`). Don't open-code the gate:
+  the SDK owns which spelling is correct — `signedIn` is optional on the wire
+  and is the one viewer field the init validator deliberately does not reject
+  when malformed, so `isSignedIn` answers from presence instead. Hover it for
+  the full reasoning. Need the identity itself? Use
+  [`useViewer()`](#useviewer) — scope-gated and audited per call.
+- `theme` — `'light' | 'dark'`. **Set `data-theme={theme}` on your root** (gotcha #60).
+  LIVE: it starts at the `BLOCK_INIT` value and then tracks the host's
+  `THEME_CHANGE` push when the viewer toggles dark mode mid-session — see
+  [`useBlockTheme()`](#useblocktheme).
+- `settings` — `{ publisherSettings, userSettings }`.
+
+### `useBlockTheme()`
+
+The host's CURRENT site theme, and nothing else. Same value as
+`useBlockContext().theme` — reach for this when theme is all you need.
+
+```tsx
+function ThemedRoot() {
+  const theme = useBlockTheme(); // 'light' | 'dark'
+  return <div data-theme={theme}>…</div>;
+}
+```
+
+The viewer can toggle light/dark **while your block is mounted**. The host pushes
+a `THEME_CHANGE` message and this hook re-renders. You get that for free as long
+as you *read* the theme on every render — a block that copies it into state once
+at mount, or writes `data-theme` imperatively in a mount-only effect, will stay
+stuck on the old theme.
+
+Against a host that predates `THEME_CHANGE` the value simply never moves (the
+old behaviour). Nothing awaits the message, so there is no hang either way.
+
+Exercise it locally: `createMockHost(...).setTheme('light')` (and the same on the
+`dev:live` host) pushes the real message.
+
+### `useBlockResize(ref)`
+
+Attach to your root element. Observes its height and posts `RESIZE_IFRAME` so the
+host sizes the iframe to fit. No-op on the inline transport (host DOM reflows
+naturally).
+
+```tsx
+const rootRef = useRef<HTMLDivElement>(null);
+useBlockResize(rootRef);
+```
+
+**The element may mount on a later render, and that is the normal case** — a
+block renders a skeleton until `BLOCK_INIT` lands. The hook keys on the observed
+*element*, so you do **not** need to pin the same `ref` to every branch of a
+loading/ready conditional to keep the host resizing. Put it on the root you
+actually want measured, in whichever branch renders it.
+
+> Also set `iframe.minHeight` in your manifest to the block's *real* rendered
+> height — a too-small minHeight makes the iframe seed short and grow-jump on
+> `BLOCK_READY` (CLS). Measure it in the dev harness (gotcha #53).
+
+### `useBlockBreakpoint(ref?)`
+
+Reports the block's **own** width tier, so you can branch on "am I narrow?"
+without hand-rolling a `ResizeObserver` or hard-coding pixel numbers.
+
+```tsx
+const bp = useBlockBreakpoint();
+<div style={{ display: 'flex', flexDirection: bp.below('sm') ? 'column' : 'row' }}>
+  {bp.atLeast('md') && <aside>…</aside>}
+</div>
+```
+
+- `tier` — `'base' | 'xs' | 'sm' | 'md' | 'lg' | 'xl'` on civitai's **px** scale
+  (480 / 768 / 1024 / 1184 / 1440 — *not* Mantine's em scale, which agrees only
+  on `sm`). Tailwind semantics: a tier applies at its breakpoint and above.
+  `'base'` is narrower than `xs`, where both a 360px phone and the desktop
+  `model.sidebar_top` slot land.
+- `atLeast(key)` / `below(key)` — the comparators you actually want at a call site.
+- `measured` — `false` until the first measurement lands. An unmeasured width
+  resolves to `'base'`, so gate a *structural* narrow branch on
+  `measured && below('sm')` if a one-frame swap would be jarring.
+
+> **Container query, not a media query.** It observes an element — by default
+> `document.documentElement`, which inside the block's sandbox iframe *is* the
+> slot the host gave you. Slot width is not monotonic in viewport width (the
+> `model.sidebar_top` slot is ~360px at a 360px viewport and only ~430px at a
+> 1440px one), so a `matchMedia` inside the frame answers the wrong question.
+> Pass a `ref` to measure a nested container instead.
+
+> **No re-render storm.** A `ResizeObserver` fires on every pixel; this hook
+> stores the resolved *tier* and returns a referentially stable object while the
+> tier is unchanged, so a 200px drag inside one tier re-renders zero times. That
+> is also why the raw width is not returned — it would either cost a render per
+> pixel or be stale.
+
+### `useBlockToken()`
+
+Current block-scoped JWT, auto-refreshing ~2 min before expiry. Returns the token
+fields plus a `refresh()` for the 401-retry path, which **resolves with the new
+token**.
+
+```tsx
+const { raw, scopes, expiresAt, buzzBudget, refresh } = useBlockToken();
+
+let res = await fetch(url, { headers: { Authorization: `Bearer ${raw}` } });
+if (res.status === 401) {
+  const fresh = await refresh();   // resolves WITH the new token
+  res = await fetch(url, { headers: { Authorization: `Bearer ${fresh.raw}` } });
+}
+```
+
+> **Retry with the resolved token, not the `raw` you destructured.** That `raw` is
+> a `const` from the render closure that ran *before* the refresh — awaiting
+> `refresh()` re-renders the component but cannot reassign the binding your
+> in-flight callback is already holding. A retry that re-reads the outer `raw`
+> re-sends the stale JWT and 401s for exactly the reason the first call did.
+
+### `useHostOrigin()`
+
+The validated host origin to direct-fetch the App Blocks HTTP API against —
+`undefined` until init. Use it as the base URL when you need to bypass the host
+bridge, always paired with the bearer token from `useBlockToken()`.
+
+```tsx
+const host = useHostOrigin();          // e.g. "https://civitai.com" (undefined until BLOCK_INIT)
+const { raw } = useBlockToken();
+// Once `host` is set, fetch the API on that validated origin with the block token:
+if (host) {
+  const res = await fetch(`${host}/api/v1/blocks/me`, {
+    headers: { authorization: `Bearer ${raw}` },
+  });
+}
+```
+
+> **Security:** this is ONLY ever the origin that passed the SDK's origin
+> allowlist (the same gate `BLOCK_INIT` passes) — never `document.referrer` or
+> `window.location` of the parent. The block token is a money-scoped bearer
+> credential, so always send it to *this* origin. Never derive the API host
+> from a spoofable browser signal.
+
+### `useBlockSettings()`
+
+Shorthand for `useBlockContext().settings`. Read-only from the iframe — there is
+no general "set settings" bridge message. Writing them is platform-side, in the
+settings panel reached from the **Manage** control on an installed app. The one
+setting a block can write itself is the viewer's checkpoint, via the
+`SET_USER_CHECKPOINT` message (see `useCheckpointPicker`).
+
+```tsx
+const { publisherSettings, userSettings } = useBlockSettings();
+```
+
+### `useBuzzWorkflow()`
+
+The generation flow: `estimate` → `submit` → `poll`, host-mediated. Returns
+`{ estimate, submit, poll, status, result, error }`.
+
+```tsx
+import type { WorkflowBody } from '@civitai/app-sdk/blocks';
+
+const { estimate, submit, poll, status, result } = useBuzzWorkflow();
+declare const modelId: number, modelVersionId: number, userPrompt: string;
+
+const body: WorkflowBody = {
+  kind: 'textToImage',
+  modelId,
+  modelVersionId,
+  params: { prompt: userPrompt },
+};
+// The viewer-facing copy is a string YOUR APP owns, chosen by `err.code`.
+// Nothing on the error may be rendered: `err.message` is developer-facing and
+// its wording is not a contract; `err.snapshot.error` is server-authored and
+// unsanitised.
+const estimateFailureMessage = (err: WorkflowEstimateError) =>
+  err.code === 'no-cost'
+    ? 'We could not get a price for this configuration. Try adjusting it.'
+    : 'Pricing is unavailable right now. Please try again shortly.';
+
+// 🔴 estimate() REJECTS when the reply carries no usable price. ALWAYS catch it.
+let priced = false;
+try {
+  await estimate(body);          // status 'estimating' → 'confirming' (cost in result.cost.total)
+  priced = true;
+} catch (err) {
+  if (!(err instanceof WorkflowEstimateError)) throw err;
+  // status is now 'error'. Log both for the developer; render neither.
+  logForDebugging(err.message, err.snapshot.error);
+  showError(estimateFailureMessage(err));
+}
+if (priced) {
+  // 🔴 submit() REJECTS when the reply carries no usable workflow outcome. A
+  // priced refusal is different — it RESOLVES.
+  try {
+    const snap = await submit(body); // status 'submitting' → 'polling'
+    if (snap.status === 'failed') {
+      // 🔴 A RESOLVED `failed` IS A PRICED SERVER OUTCOME — and only SOME of
+      // them are about the viewer's wallet. Affordability (per-call budget, the
+      // per-user daily Buzz cap) IS fixable by buying Buzz; the per-app velocity
+      // limit, the per-app aggregate daily cap, a fail-closed "temporarily
+      // unavailable" deny and a missing price quote are NOT. Selling Buzz for
+      // one of those takes money and fixes nothing, so branch before you offer.
+      showError(submitOutcomeMessage(snap)); // YOUR app owns this copy
+    } else {
+      await poll(snap.workflowId);   // you loop this on a backoff until terminal
+    }
+  } catch (err) {
+    if (!(err instanceof WorkflowSubmitError)) throw err;
+    // Log both for the developer; render neither.
+    logForDebugging(err.message, err.snapshot.error);
+    // 🔴 TWO SEPARATE QUESTIONS — DO NOT CONJOIN THEM. `code` decides what you may
+    // say about MONEY; the id decides only whether there is something to POLL.
+    // Folding the id test into the `code` test sends a 'workflow-failed' reply
+    // whose id is 'whatif' into the reassuring arm — the exact blind-retry
+    // invitation this whole guard exists to remove.
+    if (err.code === 'workflow-failed') {
+      // 🔴 Spend MAY ALREADY BE COMMITTED. Do not tell the viewer it was free,
+      // and do not retry blindly — a retry mints a fresh idempotency key, i.e. a
+      // SECOND reservation.
+      showError('The generation may have started but did not complete. Check your history.');
+      // Only NOW ask about pollability: 'whatif' is a non-workflow sentinel.
+      if (err.snapshot.workflowId !== 'whatif') await poll(err.snapshot.workflowId);
+    } else {
+      // 🔴 'exception' means the host had no workflow to report — USUALLY nothing
+      // was queued, but a lost response or an in-progress idempotency conflict
+      // reaches this arm too. Retry with the SAME idempotencyKey, not a fresh one.
+      showError('Could not start the generation. Please try again.');
+    }
+  }
+}
+```
+
+**Status semantics** (gotcha #8/#9/#10):
+
+- `status === 'confirming'` is **IDLE** (estimate landed, user reviewing the
+  cost) — keep the Generate button enabled. Only `estimating | submitting |
+  polling` are busy.
+- `result` is populated after `estimate()` too — don't treat a non-null `result`
+  as "something is queued."
+- The hook does **not** auto-poll. After `submit` flips status to `'polling'`,
+  the **caller** runs a `useEffect` that calls `poll(workflowId)` on a backoff
+  until the snapshot is terminal (`succeeded | failed | canceled | expired`).
+- A **priced** submit refusal comes back as a **resolved** snapshot with
+  `status: 'failed'`, an `error` string, **and a numeric `cost.total`** — the
+  price the server refused to charge. That is a workflow *outcome*, not an error.
+  Check `snap.status`, not just `try/catch`.
+  🔴 **Not all of them are affordability.** Only the per-call `buzzBudget` gate
+  and the per-user daily Buzz cap are about the wallet. The per-app **velocity**
+  limit, the per-app **aggregate daily** cap, a fail-closed **"temporarily
+  unavailable"** deny and a **missing price quote** are priced outcomes too, and
+  buying Buzz fixes none of them. Branch before you offer a top-up.
+- **`submit` REJECTS when the reply carries no usable workflow outcome**
+  (`@civitai/blocks-react@0.44.0+`). Every failure-shaped reply reports
+  `status: 'failed'`, so `status` cannot tell them apart — **`cost` presence
+  decides resolve-vs-reject, and `workflowId` decides which rejection**:
+  - **priced refusal** → carries `cost`. **Resolves**, as above.
+  - **a reply the host built itself** (`failureSnapshot(err)`, which stamps the
+    literal `workflowId: 'failed'` — from a `catch` or a short-circuit such as
+    the moderator-review nack) → no `cost`. **Rejects** with
+    `err.code === 'exception'`, which means *the host had no workflow to report*.
+    🔴 **Not the same as "nothing happened."** Usually nothing was queued or
+    charged and a retry is fine, but a **lost response**, an **in-progress
+    idempotency conflict**, or a **transient 5xx/408/429/401** also land here,
+    and a workflow may have been created and charged. Prefer reusing the same
+    `idempotencyKey` on retry, and don't render "nothing was charged" as fact.
+  - **a failed, unpriced reply whose id is NOT that sentinel** (normally a
+    genuine orchestrator id) → no `cost`. **Rejects** with
+    `err.code === 'workflow-failed'`.
+    🔴 **Money may already be committed.** Server-side, *any* resolved submit
+    keeps its Buzz reservation "regardless of snapshot status", with no refund on
+    a non-throwing failed snapshot. So do not tell the viewer it was free, and do
+    not retry blindly — `submit()` mints a fresh `idempotencyKey` per call, so an
+    automatic retry is a second reservation. Read `err.snapshot.workflowId` (a
+    usually-pollable id) and `watch`/`poll` it to learn the workflow's actual
+    fate — guarding with `err.snapshot.workflowId !== 'whatif'` first, since the
+    server treats both `'failed'` and `'whatif'` as non-workflow sentinels.
+
+  Before that version everything resolved, so a block branching on
+  `snap.status === 'failed'` could not tell "you can't afford this" from "the
+  request failed", and one gating a money control on
+  `typeof snap.cost?.total === 'number'` saw the same dead-control shape
+  civitai/civitai#4159 describes. An ordinary in-flight reply
+  (`{ status: 'pending' }`) is cost-less too and still resolves — and so are
+  cost-less `succeeded` / `canceled` / `expired` replies. Only a *failure-shaped*
+  reply with no price rejects. `err.message` is a generic developer-facing
+  constant that makes **no claim about money** (the two codes differ on that) and
+  the server's words stay on `err.snapshot.error`, exactly as on
+  `WorkflowEstimateError` below. Note this also fires in **moderator review
+  preview**. To exercise your `catch` locally, set the mock host's
+  `generation.failSubmitException: true`.
+- **`estimate` follows the same rule for a different question** (`@civitai/blocks-react@0.43.0+`).
+  It **rejects** with a `WorkflowEstimateError` when the reply carries no usable
+  price, rather than resolving a snapshot with no `cost`. Two things produce
+  that, and `err.code` tells them apart: `'failed'` (the estimate errored
+  server-side) and `'no-cost'` (an otherwise-successful reply that simply has no
+  price).
+  Before that version both cases resolved, so a block that correctly gates
+  Confirm on `typeof cost === 'number'` rendered a dialog it could never confirm
+  ("Cost unavailable") and the server's reason was discarded — civitai/civitai#4159.
+  Note this also fires in **moderator review preview**, where the host answers
+  every workflow request with `'not available in review preview'`: without a
+  `catch`, a reviewer's first click becomes an unhandled rejection.
+  To exercise your `catch` locally, set the mock host's
+  `generation.failEstimate: 'failed' | 'no-cost'`.
+- **Three fields, three audiences — and none of them is viewer-facing copy.**
+  The string a viewer sees is one **your app owns**; nothing on this error may
+  be rendered as-is.
+  - `err.code` (`'failed' | 'no-cost'`) — **the branch target**, and the only
+    stable one. Switch on it to pick your own localised message.
+  - `err.snapshot.error` — **the diagnostic read**, and recovering it is the
+    whole point of the fix. **Server-authored and unsanitised** (raw upstream
+    text, including database constraint names, can reach it): log it or show it
+    in a developer-facing surface, and **never render it verbatim into markup**.
+  - `err.message` — **developer-facing**. A generic constant naming only the code
+    (`estimate did not return a usable price (no-cost) — reason on .snapshot.error`),
+    because `message` is what an uncaught rejection prints and what an error
+    reporter ships by default. Safe to log and to let a stack trace print;
+    **not intended for display to viewers** — it names an internal field path,
+    it is not localised, and **its exact wording is not a contract**, so a UI
+    built on it silently rots. Two apps migrating to `0.43.0` piped it into
+    rendered UI and would have shipped that sentence to end users.
+- A cost of **`0` is a real price**, not a missing one (the orchestrator whatif
+  prices a cache hit at 0). `estimate` resolves it; only a non-numeric
+  `cost.total` rejects.
+
+> **Estimate must mirror submit** (gotcha #59): build the params for `estimate`
+> with the *exact* same logic as `submit` — same seed decision especially. The
+> orchestrator whatif prices a cache hit (identical workflow) at 0 and a fresh
+> job at full cost, and the seed decides which. A drifting estimate silently
+> mis-quotes. See the `buzz-workflow` example.
+
+> **cancel** — `@civitai/blocks-react@0.5.0+` adds `useBuzzWorkflow().cancel(workflowId)`
+> for a real server-side orchestrator cancel (gotcha #51), so a running workflow
+> stops spending Buzz. Before that, cancel was client-side only (stop polling). If
+> your installed version predates 0.5.0, do the client-side half and add the
+> `cancel(...)` call after upgrading.
+
+### `useBuzzPurchase()`
+
+Open the Buzz purchase modal — the insufficient-budget recovery path.
+
+```tsx
+const { openPurchaseModal } = useBuzzPurchase();
+const { purchased, newBalance } = await openPurchaseModal(suggestedAmount);
+if (purchased) { /* retry the generation */ }
+```
+
+### `useBuzzBalance()`
+
+The signed-in viewer's per-pool Buzz balance (`{ blue, green, yellow }` — the
+domain-clamped pools a block may read; never the platform-internal `red`/`purple`).
+Host-mediated over `GET_BUZZ_BALANCE` → `BUZZ_BALANCE_RESULT`; same trust model as
+`useBuzzWorkflow`/`useBuzzPurchase` (the host resolves the viewer from the block
+token — the block never touches the balance API). Fetches on mount; `refetch` for
+on-demand refreshes.
+
+```tsx
+const { balance, loading, error, refetch } = useBuzzBalance();
+// `balance` is null until the first successful fetch. refetch() after a
+// generation debits it. An anon viewer / missing scope / host failure → `error`.
+if (!loading && balance) console.log(`Yellow: ${balance.yellow}`);
+```
+
+> Per-account Buzz: `useBuzzWorkflow().submit(body)` also takes an optional
+> `body.accountType` (`'blue' | 'green' | 'yellow'`) — a *preference* for which
+> pool funds the generation; the host clamps it server-side.
+
+### `useViewer()`
+
+The signed-in viewer as an on-demand authoritative self-read (`{ id, username,
+status, buzzBudget }`) — distinct from `useBlockContext().viewer`, the coarse
+`BLOCK_INIT`-time snapshot. `status` is `'active' | 'muted'`; `username`
+(`string | null`) and `buzzBudget` (`number | null`) are present-but-nullable, so
+handle the null case. Host-mediated over `GET_VIEWER` → `VIEWER_RESULT` (the host
+resolves the viewer from the block token via `blocks.getMyViewer`); an anonymous /
+banned viewer comes back as `error`. Fetches on mount; `refetch` for on-demand
+refreshes.
+
+```tsx
+const { viewer, loading, error, refetch } = useViewer();
+// `viewer` is null until the first successful fetch. An anon / banned viewer,
+// missing scope, or host failure → `error`. `username`/`buzzBudget` may be null.
+if (!loading && viewer) console.log(`${viewer.username ?? 'anon'} · budget ${viewer.buzzBudget ?? 0}`);
+```
+
+### `useBuzzTransactions(params?)`
+
+The signed-in viewer's Buzz-transaction ledger (a paged, host-projected read of
+the Buzz dashboard). Returns `{ transactions, cursor, loading, error, refetch }`;
+`transactions` rows are rehydrated so `date` is a `Date`. Pass the returned
+`cursor` back as `params.cursor` to page forward. Requires the `buzz:read:self`
+scope; host-mediated over `GET_BUZZ_TRANSACTIONS`.
+
+```tsx
+const { transactions, cursor, loading, error } = useBuzzTransactions({ type: 'Tip', limit: 20 });
+if (!loading && transactions) transactions.forEach((t) => console.log(t.type, t.amount, t.date));
+```
+
+### `useBuzzAccounts()`
+
+The viewer's all-pool Buzz balances — the three spendable pools **plus** the
+creator payout pools (`{ accountType, balance }[]`), a superset of
+`useBuzzBalance`. Returns `{ accounts, loading, error, refetch }`. Requires
+`buzz:read:self`; host-mediated over `GET_BUZZ_ACCOUNTS`.
+
+```tsx
+const { accounts, loading, error } = useBuzzAccounts();
+if (!loading && accounts) accounts.forEach((a) => console.log(a.accountType, a.balance));
+```
+
+### `useDailyCompensation(params)`
+
+Per-modelVersion generation-compensation for the month containing `params.date`
+(Buzz totals + cash totals in pennies). Returns `{ resources,
+hasPublishedResources, loading, error, refetch }`. Requires `buzz:read:self`;
+host-mediated over `GET_DAILY_COMPENSATION`.
+
+```tsx
+const { resources, hasPublishedResources } = useDailyCompensation({ date: '2026-07-01' });
+```
+
+### `useWildcardPack(modelVersionId)`
+
+Import a wildcard pack's parsed prompt lists by model version — the host
+resolves + fetches + unzips + parses it **in the user's own page session** (every
+download gate enforced), so the untrusted iframe never sees the bytes. Returns
+`{ pack, loading, error, refetch }`. On failure `error` is a `WildcardPackError`
+with a discriminated `code` (`not-found` / `forbidden` / `too-large` /
+`parse-failed` / `busy` — `busy` is retryable), not free text.
+
+```tsx
+const { pack, loading, error, refetch } = useWildcardPack(modelVersionId);
+// `error.code === 'busy'` is retryable — call refetch(); the other codes are terminal.
+if (error instanceof WildcardPackError && error.code === 'busy') void refetch();
+if (!loading && pack) console.log(Object.keys(pack.lists));
+```
+
+### `useCollectionFollow()`
+
+Follow / unfollow a collection **for the viewer**, host-mediated over
+`SET_COLLECTION_FOLLOW`. Returns `{ setFollow, pending, error }`.
+
+**No block scope, and no token on the wire.** The host calls the session-authed
+`collection.follow` / `collection.unfollow` procedures, which self-bind to the
+viewer server-side — `collectionId` is the only thing a block influences.
+
+🔴 **Every call opens a host-chrome consent confirm naming the collection**, and
+that click is the *only* consent this path has ever had: the HTTP predecessor's
+`collections:write:self` scope is consent-exempt server-side and prompted nobody.
+Moving to this bridge **tightens** the flow; what it gives up is the manifest
+`scopes` declaration a moderator reads before install. The host resolves the
+collection's name itself (there is no `name` field on the wire, deliberately) and
+bounds that to **20 distinct ids per block instance** — past the cap it refuses
+with `collection-unavailable`, the same code a collection the viewer cannot see
+gets.
+
+`setFollow` **rejects** with a `CollectionFollowError` on every non-success. Two
+of those are not failures to render:
+
+| | meaning | what to do |
+|---|---|---|
+| `err.declined` | the viewer dismissed the confirm — **no write occurred** | revert, say nothing |
+| `err.signInRequired` | no session | route into `useRequestSignIn()` |
+| `err.timedOut` | no reply arrived within the 10-min consent bound | 🔴 **check this BEFORE `.message`** — it also has no `.code`, and its message is an SDK-internal string. It does **not** mean no write occurred; re-read your state |
+| `err.code` set otherwise | a host refusal (`invalid-request` / `review-mode` / `not-ready` / `collection-unavailable`) | show or ignore per case |
+| `err.code === undefined` **and** `!err.timedOut` | a **server** message the host forwarded verbatim | show `err.message` |
+
+```tsx
+const { setFollow, pending } = useCollectionFollow();
+const { requestSignIn } = useRequestSignIn();
+
+async function toggle() {
+  try {
+    const result = await setFollow({ collectionId, follow: !followed });
+    setFollowed(result.followed); // adopt the host's echo, not the guess
+  } catch (err) {
+    if (err instanceof CollectionFollowError) {
+      if (err.signInRequired) return requestSignIn();
+      if (err.declined) return; // the viewer said no — say nothing
+      if (err.timedOut) return showToast('Still working — check back in a moment.');
+      showToast(err.message); // a real server message, safe to render
+    }
+  }
+}
+```
+
+Most blocks want `<FollowButton>` from `@civitai/blocks-react/ui` instead, which
+wires all of the above.
+
+### `useCreatePostFromApp()`
+
+Publish a **real, published Post on the viewer's profile** from this app's own
+outputs, host-mediated over `CREATE_POST_FROM_APP`. Returns
+`{ createPost, pending, error }`.
+
+The strictly-more-consequential sibling of `usePublishGenerationOutputs()`: that
+one makes a bare `Image` row with no post, no feed presence, no reward and no
+notification; this one makes **public, feed-visible, reward-earning content under
+the viewer's byline**.
+
+🔴 **Requires the `posts:write:self` scope**, which is **sensitive** and
+**consent-gated**. Declare it in your manifest *with* a `scopeJustifications`
+entry — the server rejects the manifest at submit without one — and expect the
+viewer to be prompted to grant it before the first call succeeds.
+
+🔴 **The grant is not the consent.** Every call opens a host-chrome confirm, and
+what it shows is the **server's** resolution of your request, never your strings:
+the tag names that will *actually* be applied, host-fetched model and version
+names for a gallery attach, and real thumbnails. A block cannot show one post and
+publish another.
+
+🔴 **No arm of `sources` takes a URL.** Name a workflow from this app's own
+subqueue plus indexes into its outputs, or `Image` ids from a previous
+`usePublishGenerationOutputs()` publish. The server re-verifies both — ownership,
+this app's provenance marker, and that the image is not already in a post.
+
+⚠️ **Posting a published image removes it from this app's own grid.** The
+app-scoped read behind `useGatedImages()` is conjoined with `postId IS NULL`, so
+an image that joins a post stops resolving there. An app cannot both keep an
+image in its shared grid and let the viewer post it — design around it.
+
+Text is advisory: the server bounds `title`/`detail`, screens them, refuses a
+`detail` containing a link, and resolves `tags` against **existing** tags only (a
+name matching no tag is dropped, never minted, and is shown to the viewer on the
+confirm).
+
+`createPost` **rejects** with a `CreatePostError` on every non-success:
+
+| | meaning | what to do |
+|---|---|---|
+| `err.declined` | the viewer dismissed the confirm — **no post was created** | revert, say nothing |
+| `err.signInRequired` | no session | route into `useRequestSignIn()` |
+| `err.timedOut` | no reply arrived within the 10-min consent bound | 🔴 **check this BEFORE `.message`** — it also has no `.code`, and its message is an SDK-internal string. It does **not** mean nothing happened; tell the viewer to check their profile and never retry automatically |
+| `err.code` set otherwise | a host refusal (`review-mode` / `block is not ready` / `no images to post` / `no block token`) | show or ignore per case |
+| `err.code === undefined` **and** `!err.timedOut` | a **server** message the host forwarded verbatim (rate limit, blocked title, refused gallery attach) | show `err.message` |
+
+```tsx
+const { createPost, pending } = useCreatePostFromApp();
+const { requestSignIn } = useRequestSignIn();
+
+async function share() {
+  try {
+    const post = await createPost({
+      sources: [{ kind: 'workflow', workflowId: w.workflowId, imageIndexes: [0, 2] }],
+      title: 'Made with Sticker Studio',
+    });
+    showToast(`Posted! ${post.url}`);
+  } catch (err) {
+    if (err instanceof CreatePostError) {
+      if (err.signInRequired) return requestSignIn();
+      if (err.declined) return; // the viewer said no — say nothing
+      if (err.timedOut) return showToast('Still working — check your profile.');
+      showToast(err.message); // a real server message, safe to render
+    }
+  }
+}
+```
+
+In `dev:mock` the `createPostResult` / `createPostError` scenario knobs drive
+both arms (including `declined`). **`dev:live` refuses this bridge on purpose** —
+it has no civitai chrome to render the server-resolved confirm in, and driving
+the write without it would let dev prove out a flow production does not have.
+
+### `useAppWorkflows(params?)`
+
+The calling app's **own** generator subqueue — the tag-scoped list of generations
+**this app** produced for the viewer (newest-first), plus a fail-closed `cancel`.
+The host self-binds the account off the block token and **forces** the per-app tag
+filter, so a block only ever sees the queue it produced — never the viewer's
+personal queue or another app's. Returns `{ workflows, cursor, loading, error,
+refetch, cancel }`; each `AppWorkflow` is `{ workflowId, status, images[], cost,
+createdAt }`. Pass the returned `cursor` back as `params.cursor` to page forward.
+Requires `ai:write:budgeted` (same trust boundary as submit); host-mediated over
+`QUERY_APP_WORKFLOWS` / `CANCEL_APP_WORKFLOW`.
+
+`cancel(workflowId)` sends `CANCEL_APP_WORKFLOW`, resolves once the host confirms
+the terminal state (which is optimistically spliced into `workflows` in place — no
+refetch round-trip), and rejects with the host's error on failure.
+
+```tsx
+const { workflows, cursor, loading, error, refetch, cancel } = useAppWorkflows({ limit: 20 });
+if (!loading && !error) {
+  workflows.forEach((w) => console.log(w.workflowId, w.status, w.images.length, w.cost));
+}
+async function onCancel(id: string) {
+  try {
+    await cancel(id); // optimistically flips the row to `canceled`
+  } catch (err) {
+    console.error('cancel failed', err);
+  }
+}
+```
+
+### `useAppStorage()`
+
+KV datastore, host-mediated. Keys are **namespaced** per (block instance,
+viewer); the byte and row **budgets** are enforced per (**app**, viewer), so
+every instance of one app shares one budget for that viewer.
+
+```tsx
+import {
+  APP_STORAGE_MAX_VALUE_BYTES, // largest single value, in wire bytes
+  APP_STORAGE_MAX_BYTES,       // total stored bytes per (app, viewer)
+  APP_STORAGE_MAX_ROWS,        // total rows per (app, viewer)
+} from '@civitai/app-sdk/blocks';
+
+const storage = useAppStorage();
+await storage.set('key', { any: 'json' });   // rejects over ANY of the three — and on a >200-char key
+const v = await storage.get<MyShape>('key'); // null if unset / anon
+await storage.delete('key');                  // idempotent
+const { keys } = await storage.list({ prefix: 'note-' });
+const quota = await storage.getQuota();       // { usedBytes, rowCount, limitBytes, limitRows }
+```
+
+🔴 **For the byte/row budget, `getQuota()` is the authority for those two
+numbers and the constants are a snapshot.** All three above are compiled-in
+figures **as of the version of `@civitai/app-sdk` you installed** — which is the
+same frozen-number failure mode this page used to demonstrate, just with one
+copy instead of nine. The host can move any of them without your lockfile
+changing. So:
+
+- **Render `getQuota()`'s reply**, never a constant, anywhere a viewer sees a
+  number or a code path decides whether a write will fit.
+- **Reach for the constants only where no quota reply is available** — a
+  build-time sanity check, a test fixture, a rough design-time estimate — and
+  treat the answer as "roughly, at install time".
+- **Re-check after any SDK bump**, and expect movement: the per-viewer clamp
+  was sized against a measured distribution and the host says to expect a
+  re-measure. `appStorageLimits.ts` in `@civitai/app-sdk` carries the
+  provenance and a one-liner that re-derives the current values from the host.
+
+Never hard-code a figure of your own: the docs here used to quote the app-wide
+umbrella instead of the per-viewer clamp and were **25x** out on bytes and
+**1000x** out on rows.
+
+🔴 **That authority stops at the budget, and so does the list above.**
+`getQuota()` answers `{ usedBytes, rowCount, limitBytes, limitRows }` and
+nothing more, so it reports neither of the other two ceilings: the host's
+**200-character cap on `key`**, nor `APP_STORAGE_MAX_VALUE_BYTES`, which is a
+per-**write** cap rather than part of the per-(app, viewer) budget. A write that
+fits the quota reply is still refused if its key is too long or its value is
+over the per-value cap — and for the key, nothing local catches it
+([#370](https://github.com/civitai/civitai-app-starters/issues/370), detailed
+below). Cap or hash long keys in your block.
+
+🔴 **The ROW ceiling is usually the binding one, and a byte-based "x of y used"
+readout will not see it coming.** A block caching one modest record per item a
+viewer touches exhausts `limitRows` while still holding a small fraction of
+`limitBytes`. Show rows too.
+
+`createMockHost()` defaults to these same ceilings and enforces the per-value
+cap, the byte budget and — since it was added — the **row** budget on write, so
+a row-limit overrun now fails under `dev:mock` where it previously passed and
+failed only in production. Pass `storage: { quotaBytes, limitRows }` to
+simulate something smaller.
+
+⚠️ The mock is **not** gate-for-gate identical to the host. Five known
+divergences:
+
+- the byte gate refusing a shrinking overwrite that the host admits
+  ([#345](https://github.com/civitai/civitai-app-starters/issues/345));
+- 🔴 the byte gate counting **wire** bytes where the host counts **stored**
+  bytes — `octet_length(value::jsonb::text)`, larger for every container, up to
+  ~1.5x ([#347](https://github.com/civitai/civitai-app-starters/issues/347));
+- nothing models the **app-wide** umbrella, so `app quota exceeded` and `app row
+  limit exceeded` cannot be produced here at all
+  ([#368](https://github.com/civitai/civitai-app-starters/issues/368));
+- lowering `valueCapBytes` moves the **gate** but not the **message**, which
+  keeps naming the host's real cap
+  ([#369](https://github.com/civitai/civitai-app-starters/issues/369));
+- 🔴 no key-length cap: the host refuses a `key` over **200 characters**
+  zod-side, and neither the mock nor `useAppStorage` does
+  ([#370](https://github.com/civitai/civitai-app-starters/issues/370)).
+
+Passing under `dev:mock` is evidence, not proof — and note that the second, the
+third and the fifth are **permissive**: each lets a write pass locally that
+production will reject. (#347 under-counts the bytes; #368 models no app-wide
+ceiling at all, so a write the host would refuse with `app quota exceeded`
+succeeds here; #370 admits an over-length key the host refuses outright.)
+Size your fixtures against `getQuota()`, not against what the mock accepted.
+
+🔴 **A rejection carries a host-authored MESSAGE, not a code.** There is no
+`PAYLOAD_TOO_LARGE` on the wire — that is the TRPC *code*, and the host's
+bridge forwards `err.message`. Six **ceiling** strings are measured and
+single-sourced in the app-sdk's `blocks/appStorageErrors.ts` — one per
+`PAYLOAD_TOO_LARGE` site in the host's router, plus the bridge's `storage
+request failed` fallback — and `createMockHost` draws its rejections from that
+same module, so for the ceilings the mock HAS it answers the message production
+would send, and `classifyAppStorageError(err)` picks the same branch in both.
+
+🔴 **Those six are not every string a block can receive — and nothing here
+enumerates the rest.** The bridge catches every rejection out of
+`apps.storage.*` with a *blanket* `catch` and puts its message on the same
+`error` field, so the host's authorization, approval and feature-flag prose —
+**plus tRPC's own zod input-validation messages, which never reach a handler at
+all** — travel the identical path. **Every one of them classifies `null`.**
+
+🔴 **One of those zod bounds is a ceiling a real block hits with no local
+warning: `key` is capped at 200 characters** (`z.string().min(1).max(200)` on
+the host's `get`/`set`/`delete` input schema; `list` also caps `prefix` at 200
+and `cursor` at 400). Neither `useAppStorage` nor `createMockHost` caps the key
+— both forward it verbatim and the mock has no length gate
+([#370](https://github.com/civitai/civitai-app-starters/issues/370)) — so a key
+built from a URL or a model name can save fine under `dev:mock` and fail
+forever in production, classified `null`. **The reload the `null` arm below
+recommends does not fix it.** Cap or hash long keys in your block.
+
+That is the whole rule, and it is stated structurally on purpose: the SDK owns
+a chosen slice of the ceiling vocabulary, not the host's error surface, so the
+honest claim is "**these six** classify, everything else is `null`" — which
+needs no list and stays true when the host adds or rewords a message. Note it
+is deliberately *not* "every ceiling classifies": the zod key cap above is a
+ceiling that lands on `null` like everything else. Two earlier drafts of this
+section tried instead to enumerate the non-ceiling strings, and **both lists
+were short**; see the header of `blocks/appStorageErrors.ts` for what they
+missed and why no third list replaced them. `invalid block token` (an expired
+token mid-session), `block instance revoked` and `Apps are not enabled` are
+*illustrations* of what lands on `null`, never a bound on it. The practical
+consequence: `null` is a busy bucket, so see the `default` arm note below
+before writing copy for it.
+
+⚠️ **The mock reaches four of the six.** It models no app-wide umbrella
+([#368](https://github.com/civitai/civitai-app-starters/issues/368)), so
+`app quota exceeded` and `app row limit exceeded` are production-only: a block
+must still handle them, and no local run will ever exercise that branch. The
+other four are covered — the three ceilings, plus `storage request failed` via
+`storage: { failNext }`.
+
+Branch on the classifier's **reason**, never on the string. The reason is this
+SDK's and cannot move; the message is the host's and can. (That is also why the
+SDK exports `classifyAppStorageError` and the reason type, but deliberately does
+*not* export the array of messages: `MESSAGES.includes(err.message)` is equality
+against a snapshot, and the per-value message is a template over a cap the host
+is free to change.)
+
+```ts
+import { classifyAppStorageError } from '@civitai/app-sdk/blocks';
+
+let status = 'Saved.';
+try {
+  await storage.set(key, note);
+} catch (err) {
+  console.warn('[my-block] save failed:', err);  // log the host's words
+  switch (classifyAppStorageError(err)) {        // never render them
+    case 'value-too-large':
+      status = 'That note is too long to save. Try shortening it.';
+      break;
+    case 'user-row-limit':
+      status = 'You have no note slots left. Delete one to make room.';
+      break;
+    case 'request-failed':
+      // The bridge's fallback — a transport fault. Genuinely retryable.
+      status = 'Could not save that note. Please try again.';
+      break;
+    default:
+      // `null`: an unknown ceiling, or (more often) an expired/revoked token.
+      status =
+        'Could not save that note. Try reloading the page — if that does not ' +
+        'help, storage may be unavailable for this app right now.';
+  }
+}
+```
+
+🔴 **Keep the `default` arm, and do not put "please try again" in it.**
+`classifyAppStorageError` answers `null` both for a ceiling message this SDK
+version does not know (the host can reword one in any deploy) *and* for the
+whole authorization family listed above — an expired block token, a revoked
+instance, an unapproved block, a missing storage scope. Retrying fixes none of
+the second group, so the generic arm should offer a **reload** (which re-mints
+the token, and covers a transport blip too) and concede that storage may be
+unavailable. Split `'request-failed'` out if you want honest retry copy: that
+reason really is the transport one.
+
+The mock emitted the *code* until
+[#343](https://github.com/civitai/civitai-app-starters/issues/343), which is
+how a block's error branch could pass every local run and never fire in
+production.
+
+### `useSharedStorage()`
+
+App-scoped, append-only, community-votable SHARED datastore (every viewer sees
+the same list). Sibling of `useAppStorage`; anonymous viewers get the read path
+and a hard reject on mutations.
+
+```tsx
+const shared = useSharedStorage();
+const { key } = await shared.append({ title: 'Add dark mode', body: 'please' });
+const { items } = await shared.list({ limit: 20 });   // newest-first
+const count = await shared.vote(key);                 // idempotent up-vote
+await shared.unvote(key);
+await shared.withdraw(key);                            // remove my own entry
+```
+
+### `useCheckpointPicker()`
+
+Drive the platform Checkpoint picker + persist a viewer override.
+
+```tsx
+const { open, persist } = useCheckpointPicker();
+const { selected } = await open({ baseModelGroup: 'SDXL', currentVersionId });
+if (selected) await persist(selected.versionId);   // null clears the override
+```
+
+### `useResourcePicker()`
+
+Drive the platform resource picker for page blocks — `'Checkpoint' | 'LORA'`.
+The viewer searches in host chrome; the block only ever sees the one resource it
+picked. DISCOVERY ONLY — the returned `versionId` is re-validated + re-priced
+server-side at estimate/submit.
+
+```tsx
+const { open } = useResourcePicker();
+const picked = await open({ resourceType: 'LORA', baseModelGroup: 'SDXL' });
+if (picked) {
+  const versionId = picked.versionId;   // feed into body.additionalResources
+  const weight = picked.strength;        // recommended default weight (may be undefined)
+}
+```
+
+### `useImageUpload()`
+
+Host-mediated image upload — the host opens its native upload modal and the
+iframe never handles the bytes. Resolves with a moderated image (or `null` on
+dismiss); pass `{ purpose: 'generationSource' }` for an unscanned img2img source
+or `{ asyncScan: true }` for the early-resolve + `scanStatus()` flow.
+
+```tsx
+const { open } = useImageUpload();
+const img = await open();               // BlockUploadedImageInfo | null
+if (img) {
+  await submit({
+    kind: 'textToImage',
+    modelId,
+    modelVersionId,
+    sourceImage: { url: img.url, width: 1024, height: 1024 },
+    params: { prompt },
+  });
+}
+```
+
+### `useGenerationResources()`
+
+Rehydrate a saved set of generation resources by version id — WITHOUT re-opening
+the picker. Returns the same widened projection `useResourcePicker` yields
+(recommended weights, trigger words, clipSkip). DISCOVERY ONLY.
+
+```tsx
+const { fetch } = useGenerationResources();
+const resources = await fetch([691639, 666002]);   // by saved versionIds
+const first = resources[0];             // .versionId / .strength / .trainedWords / .clipSkip
+```
+
+### `useCivitaiNavigate()`
+
+Request a navigation within civitai.com (host-mediated; fire-and-forget).
+
+```tsx
+const { navigate } = useCivitaiNavigate();
+navigate('/models/12345', 'new_tab');   // 'new_tab' needs allow-popups* in the manifest sandbox
+```
+
+### `useBlockAnalytics()`
+
+Fire-and-forget event tracking into the host's analytics pipeline.
+
+```tsx
+const { track } = useBlockAnalytics();
+track('generate_clicked', { modelId });
+```
+
+### `useRequestSignIn()`
+
+Ask the host to open its sign-in flow for an ANONYMOUS viewer (fire-and-forget).
+On sign-in the host re-inits the block with the now-authenticated viewer.
+
+```tsx
+const { requestSignIn } = useRequestSignIn();
+// e.g. onClick of a "Sign in to generate" button:
+requestSignIn();
+```
+
+### `useRequestConsent()`
+
+Lazy consent: ask the host to open its consent UI when a LOGGED-IN viewer takes
+an action whose consent-gated scope the block token is missing (e.g. Generate
+needs `ai:write:budgeted` but the viewer hasn't granted it). Fire-and-forget —
+on grant the host pushes a new token; observe `useBlockToken().scopes` and retry.
+
+```tsx
+import { useRequestConsent } from '@civitai/blocks-react';
+
+const { requestConsent } = useRequestConsent();
+requestConsent({ scopes: ['ai:write:budgeted', 'buzz:read:self'] });
+```
+
+🔴 **Always pass `scopes`, with a real scope name in it — it is optional in the
+signature but a precondition for the refusal path below.** The host grants the
+missing set it computed at mint, so a bare `requestConsent()` still opens the
+consent dialog. But `CONSENT_UNAVAILABLE` is computed *from the hint*: with no
+explicit scope proven un-grantable, the host cannot tell "can never be granted"
+from "the viewer hasn't confirmed yet", so it stays silent rather than guess.
+
+The bar is an array holding **at least one non-empty string** — not merely "an
+array is present". `undefined`, a non-array, `[]`, `['']` and `[1, 2]` all
+produce silence, in `pnpm dev` and in production alike, so
+`requestConsent({ scopes: [] })` follows the instruction and still receives
+nothing. To its author that reads as a broken message rather than a thin
+argument.
+
+### `useConsentUnavailable()`
+
+Some environments withhold a scope at mint (a dev-tunnel preview token, a surface
+that carries no money scope), so no consent round-trip can ever add it. The host
+then pushes an uncorrelated `CONSENT_UNAVAILABLE` — *not* a reply, because
+`REQUEST_CONSENT` carries no `requestId`. Consume it and stop telling the user to
+retry something that can't succeed:
+
+```tsx
+import { useConsentUnavailable, useRequestConsent } from '@civitai/blocks-react';
+
+function ConsentAwareGenerate() {
+  const { requestConsent } = useRequestConsent();
+  const { refusal, reset } = useConsentUnavailable();
+
+  // 🔴 Branch on `refusal !== null`, NEVER on `refusal.scopes.length`. The host
+  // refuses on its own unfiltered set but names only scopes in the public
+  // vocabulary, so `scopes: []` is a legitimate refusal — gating on the length
+  // silently drops the very message you subscribed for. Use the names for copy.
+  if (refusal) {
+    return (
+      <div>
+        <p>Generating isn't available on this page.</p>
+        <button onClick={reset}>Try again</button>
+      </div>
+    );
+  }
+  // 🔴 `scopes` is REQUIRED for a refusal to ever arrive — see above.
+  return <button onClick={() => requestConsent({ scopes: ['ai:write:budgeted'] })}>Generate</button>;
+}
+```
+
+`refusal` holds the latest `ConsentUnavailablePayload` (`{ reason, scopes }`) or
+`null`; `reset()` clears it, since a refusal is scoped to the scopes that were
+asked for and shouldn't latch for the life of the block. Against a host that
+never sends the message the hook simply stays `null` — nothing awaits it, so
+there is no timeout to hit.
+
+🔴 **The push is UNCORRELATED, and that is the permanent shape of this API.**
+`REQUEST_CONSENT` carries no `requestId`, so a refusal cannot be matched to the
+request that provoked it. Two consequences to design around:
+
+- **Every mounted `useConsentUnavailable()` sees every refusal.** There is no
+  reliable filter: `scopes` is advisory and may legitimately be `[]`, so it
+  cannot serve as a correlation key. If two independent parts of your block
+  request different scopes, both will see both refusals. Keep a request and its
+  refusal UI in one component, or track the outstanding request yourself.
+- **A refusal is buffered across mounts, so one that arrives while the consumer
+  is unmounted is not lost.** The transport hands an unsolicited push only to
+  handlers registered at the instant it arrives, so without this a refusal that
+  landed before the consumer mounted — the requester and the consumer being
+  different components, or the consumer being conditionally rendered — vanished,
+  and the block went back to showing "click Generate again" beside the host's
+  "unavailable". `requestConsent()` arms the buffer as it sends. It keeps only
+  the latest refusal, is dropped when the block token changes (a refusal is a
+  claim about *that* token's scopes, and the grant path re-mints), and is cleared
+  by `reset()` — so the "Try again" button above genuinely resets, rather than
+  having the refusal reappear on the next mount. A `REQUEST_CONSENT` you post
+  through the raw transport instead of the hook does not arm it.
+
+Without the hook (a non-React consumer, or one wiring the transport directly),
+the same push is available untyped — note the explicit type import, which the
+cast needs and which the hook makes unnecessary:
+
+```tsx
+import { getTransport } from '@civitai/blocks-react';
+import type { ConsentUnavailablePayload } from '@civitai/app-sdk/blocks';
+
+const unsubscribe = getTransport().onMessage('CONSENT_UNAVAILABLE', (payload) => {
+  // `onMessage` hands you `unknown`; this cast is UNCHECKED, which is why
+  // `useConsentUnavailable()` is the preferred path.
+  const { reason, scopes } = payload as ConsentUnavailablePayload;
+  console.info('permission unavailable', reason, scopes);
+});
+```
+
+To exercise the refusal locally, run the mock host with
+`createMockHost({ consentGrantable: false })`, flip it live with
+`host.setScenario({ consentGrantable: false })`, or append `?consent=ungrantable`
+to the dev harness URL — the `<Harness>` chrome then reads `consent=ungrantable`
+rather than `withheld`. `dev:live` emits it too: live mode can grant nothing, so
+any request for a scope your dev token lacks produces one.
+
+### `useDomainMaturity()`
+
+Read the maturity ceiling in force for the current viewer, so a block can
+hide/blur mature affordances. **Fail-closed SFW** until `BLOCK_INIT` lands or
+against a host that projects no ceiling.
+
+```tsx
+const { isSfw, isLevelAllowed } = useDomainMaturity();
+const showRSlider = isLevelAllowed(BrowsingLevel.R);   // false on a SFW domain
+```
+
+The gates account for **two** things, and the distinction matters:
+
+| field | answers |
+| --- | --- |
+| `maxBrowsingLevel` | what this **domain** permits anybody (identical for every viewer on it) |
+| `effectiveBrowsingLevel` | what **this viewer** may be shown here — the domain ceiling narrowed by their own NSFW setting |
+
+`isSfw` / `isLevelAllowed` gate on the second, so a viewer who turned NSFW off
+sees SFW affordances even on a mature domain. `effectiveBrowsingLevel` is always
+a subset of `maxBrowsingLevel`, so reading these can only ever show the viewer
+**less** — never more. Compare the two when you want to explain *why* something
+is hidden:
+
+```tsx
+const { maxBrowsingLevel, effectiveBrowsingLevel } = useDomainMaturity();
+const hiddenByYourSettings = effectiveBrowsingLevel !== maxBrowsingLevel;
+```
+
+The hook's name is historic — it shipped when the domain ceiling was the only
+signal. There is deliberately no separate viewer-maturity hook: two hooks would
+mean two answers to "may I show this", and the one named for the domain would be
+the wider of the pair.
+
+Drive it locally with `createMockHost({ domain: 'red', viewerBrowsingLevel: BrowsingLevel.PG })`.
+The mock clamps that option to its own ceiling exactly as the real host does, so
+you cannot test against a viewer wider than the domain — production cannot
+produce one either.
+
+### `SfwGate`
+
+Convenience component that renders `children` only when the current viewer may be
+shown them — no `level` prop gates on `isSfw`, a `level` prop gates on that
+browsing-level bit. Both account for the domain **and** the viewer. Fail-closed SFW.
+
+```tsx
+function MatureSection() {
+  return (
+    <SfwGate level={BrowsingLevel.R} fallback={<SafePlaceholder />}>
+      <RRatedControl />
+    </SfwGate>
+  );
+}
+```
+
+## Direct-load fallback ("Open on Civitai")
+
+A block is served from its own origin `<slug>.civit.ai` but is designed to run
+**embedded** in the Civitai host iframe at `civitai.com/apps/run/<slug>`, which
+delivers the runtime context via the `BLOCK_INIT` handshake. If someone opens the
+bare `<slug>.civit.ai` URL **directly** (a shared link, a social crawl), no parent
+ever sends `BLOCK_INIT`, so `ready` never flips and the block hangs on its loading
+spinner forever.
+
+Wrap your app root once in `<BlockGate>` (from `/ui`) to degrade that into a
+branded landing instead:
+
+```tsx
+import { BlockGate } from '@civitai/blocks-react/ui';
+
+// A DIRECT (unembedded) top-level load shows an "Open on Civitai" card linking to
+// civitai.com/apps/run/<slug>. Embedded — and the dev harness, which posts a fake
+// BLOCK_INIT — are a transparent pass-through, so the happy path is unchanged.
+createRoot(container).render(
+  <BlockGate>
+    <App />
+  </BlockGate>,
+);
+```
+
+The trigger is precise: the fallback shows **only** when the block is top-level
+(`window.self === window.top`) **and** no `BLOCK_INIT` arrives within a short
+timeout (`~2s`, override with `<BlockGate timeoutMs={…}>`). Framed blocks never
+trip it; the harness posts `BLOCK_INIT` immediately, so it never trips there
+either. On a non-`*.civit.ai` host (e.g. `localhost` in dev), it shows a neutral
+"waiting for the host" state — never a broken `apps/run/localhost` link.
+
+Building your own landing? The primitives are exported from the package root:
+
+```tsx
+import { useDirectLoad, hostToRunUrl } from '@civitai/blocks-react';
+
+const directLoad = useDirectLoad();            // true iff top-level AND no BLOCK_INIT within the timeout
+const runUrl = hostToRunUrl('my-app.civit.ai'); // 'https://civitai.com/apps/run/my-app' | null (null = not a civit.ai host)
+```
+
+## The `/ui` subexport
+
+Opinionated components, imported separately so a transport-only block stays lean.
+Two surfaces live here:
+
+1. The **W6 component pack** — a small, Civitai-looking, self-styled component
+   set you drop straight into a block.
+2. The headless, manifest-driven **`SettingsForm`** (host-themed native controls).
+
+### W6 component pack
+
+A drop-in set of primitives that match Civitai's look (8px radius, the blue
+primary, the dark/light surfaces) — **with zero setup**:
+
+- **No Mantine dependency, no CSS import, no setup step.** The pack ships its
+  CSS as a string and injects it into your block document's `<head>` the first
+  time you render any component (idempotent). There's nothing to wire up.
+- **First paint is briefly unstyled (FOUC).** Because the CSS injects in a
+  `useEffect` (after the first paint), the very first frame of a pack component
+  renders unstyled, then snaps to themed. It's a single frame and usually
+  unnoticeable. To eliminate it, call `injectBlocksStyles()` at module init in
+  your entry file (before the first render) so the stylesheet is present up
+  front — see `injectBlocksStyles` below (already exported).
+- **Auto-themed via your block's `data-theme`.** Set `data-theme={theme}` on
+  your block's own root (from `useBlockContext().theme` — gotcha #60; the host
+  can't reach across the iframe to set it for you). The components read an
+  ancestor `[data-theme='dark']` / `[data-theme='light']`; **no attribute =
+  light**, matching the starter palette.
+
+```tsx
+import { useRef } from 'react';
+import { useBlockContext } from '@civitai/blocks-react';
+import {
+  Button, TextInput, Textarea, Card, Stack, Group,
+  Alert, Loader, Badge, Modal,
+  Slider, NumberInput, Select, Collapse,
+} from '@civitai/blocks-react/ui';
+
+export function App() {
+  const { ready, theme } = useBlockContext();
+  const rootRef = useRef<HTMLDivElement>(null);
+  if (!ready) return <div>Loading…</div>;
+
+  return (
+    // GOTCHA #60 — theme your OWN root; that's what the pack reads.
+    <div ref={rootRef} data-theme={theme}>
+      <Card>
+        <Stack gap={12}>
+          <Group justify="space-between">
+            <strong>My block</strong>
+            <Badge color="success">ready</Badge>
+          </Group>
+          <TextInput label="Prompt" description="What to generate" />
+          <Alert color="info" title="Heads up">Costs Buzz.</Alert>
+          <Button fullWidth onClick={() => {/* … */}}>Generate</Button>
+        </Stack>
+      </Card>
+    </div>
+  );
+}
+```
+
+**The components** (each with an exported props interface):
+
+| Component | Highlights |
+|---|---|
+| `Button` | `variant` (`filled`/`light`/`outline`/`subtle`), `size`, `color`, `loading` (shows a `Loader`, disables + `aria-busy`), `fullWidth`, `leftSection`/`rightSection`. Defaults to `type="button"`. |
+| `TextInput` / `Textarea` | `label` / `description` / `error` / `required`, wired via `htmlFor` + `aria-describedby` + `aria-invalid`. `Textarea` takes `minRows`. |
+| `Card` | themed surface; `withBorder`, `padding`, `radius`. |
+| `Stack` / `Group` | vertical / horizontal flex; `gap`, `align`, `justify` (+ `Group` `wrap`). |
+| `Alert` | `color` (`info`/`success`/`warning`/`error`), `title`, `withCloseButton` + `onClose`. ARIA role defaults by color — `error`/`warning` → `role="alert"` (assertive), `info`/`success` → `role="status"` (polite); pass `role` to override. |
+| `Loader` | CSS-keyframe spinner; `size`, `color`; `role="status"`. |
+| `Badge` | `variant`, `size`, `color`. |
+| `Modal` | `opened` + `onClose`, `title`, `size`; `role="dialog"` + `aria-modal`, Escape- and overlay-click-to-close, focuses the panel on open and restores focus on close. |
+| `Slider` | controlled range (`value: number`, `onChange`, `min`/`max`/`step`, `showValue`). Native `input[type=range]` — keyboard-operable, implicit `role="slider"`; accent tracks `--civitai-color-primary`. Same `label`/`description`/`error`/`required` wiring as `TextInput`. |
+| `NumberInput` | controlled numeric (`value: number \| null`, `onChange`, `min`/`max`/`step`). Rejects non-numeric (never emits `NaN`), clamps to `[min,max]` on blur, empty → `null`. Same label/description/error wiring. |
+| `Select` | controlled dropdown (`value: string`, `onChange`, `options: {value,label,disabled}[]` **or** `<option>` children, `placeholder`). Native `<select>`, `role="combobox"`. Same label/description/error wiring. |
+| `Collapse` | controlled disclosure (`open` + `onOpenChange`, `title`, `disabled`) for the "advanced params reveal". `aria-expanded` + `aria-controls`; content region `role="region"`, `hidden` when closed. |
+| `SegmentedControl` | controlled view/tab switcher (`value` + `onChange`, `data: {value,label,disabled}[]`, `fullWidth`, `size`). `role="tablist"` of `role="tab"` buttons; ArrowLeft/ArrowRight rove selection. |
+| `ReportButton` | two-step control that files a shared-board row for platform moderator review via `useSharedStorage().report()`. `noun` + `onReport` (+ `reported` for server truth). 🔴 Its visible copy is deliberately **not** overridable — see the component's JSDoc. |
+| `FollowButton` | follow/unfollow a collection over the host bridge. `collectionId` + `followed` (+ `onChange`, `collectionName`). Flips optimistically, then adopts the **host's echo**; reverts on failure. 🔴 It exists because three outcomes are easy to get wrong: `declined` reverts **silently** (the viewer dismissed the host's confirm — nothing was written), `sign-in-required` routes into `REQUEST_SIGN_IN` rather than an error line, and every other rejection reverts with a `role="alert"` note. |
+| `TipButton` | two-step Buzz tip via `useTip()`. `toUserId` + `amount` + `noun` (+ `entityType`/`entityId`, `tipped`, `remaining`, `disabledReason`, `onTipped`). 🔴 **The confirm is the component's, not host chrome** — `useTip` posts directly with the block token, so a one-press money spend is reachable without it. It mints **one idempotency key per logical tip and reuses it on retry**, so a retry after a *lost* response cannot become a second transfer. Pass `remaining` from ONE `useTipAllowance()` held by the view — it deliberately does not fetch, or a screen of cards becomes N HTTP reads. |
+| `ResourceCard` | a picked generation resource (`BlockResourceInfo`) as a grid tile (`variant="card"`) or a compact line (`variant="row"`). `interactive` is an explicit discriminant that requires `onSelect` (+ `selected`/`disabled`); `thumbnailUrl` is optional because **`BlockResourceInfo` carries no image field**, and a missing *or failed* image falls back to a frozen "No preview" frame. `actions` is the trailing flow slot on both variants; `overlay` is the decorative corner badge over the thumbnail and is **`card`-only — a type error on a `row`**. Both render as siblings of the hit area, never inside it. The name fallback, type label, placeholder copy, selected mark and accessible-name order are frozen, not props. |
+
+Every component carries a `data-civitai-ui="<name>"` hook. Most also forward
+`className` + `style` and forward a `ref` to their DOM node. **Two do not:**
+`ReportButton` renders a different element per handshake state and forwards none
+of the three (only its `data-testid`, from which the other four hooks are derived
+by suffix); `Modal` forwards `className` + `style` but takes no `ref` — it holds
+its panel node internally, so `<Modal ref={…}>` is a type error. Need
+to inject the CSS yourself (SSR, or a non-React shell)? Call
+`injectBlocksStyles(doc?)` once, or read the raw `BLOCKS_UI_STYLES` string.
+`useBlocksStyles()` is the hook the components call internally.
+
+> **Modal focus limitation (v0):** the modal focuses its panel on open and
+> restores focus on close, but it does **not** trap focus — Tab can still reach
+> content behind the overlay. That's fine for a simple confirm/settings dialog
+> inside the sandboxed block; a full focus-trap is a v1 follow-up (kept
+> dependency-free here on purpose).
+
+### `SettingsForm`
+
+The headless, manifest-driven settings form (its contract is intentionally
+**unstyled native controls** — the host page themes it, so it does *not* use the
+W6 pack):
+
+```tsx
+import { SettingsForm } from '@civitai/blocks-react/ui';
+
+<SettingsForm
+  manifestSettings={manifest.settings}
+  declaredScopes={manifest.scopes}
+  forScope="viewer"               // or "publisher"
+  initialValues={settings.userSettings}
+  onSubmit={async (values) => { /* persist (platform page) */ }}
+/>
+```
+
+`isFieldVisible` + `SettingsFormError` are also exported. See the `settings`
+example.
+
+## Lower-level transport
+
+For non-React or advanced use, the transport primitives are exported too:
+`IframeTransport`, `InlineTransport`, `BlockTransportDetector`,
+`readAllowedOriginsFromEnv`, `getTransport`, and `sendTypedRequest`. Hooks are the
+recommended surface; reach for these only when a hook doesn't fit.
+
+### How `allowedParentOrigins` entries are read
+
+Each entry is canonicalised with the URL parser before it is compared to
+`event.origin`, so these spellings all mean the same thing and all match a host
+frame at `https://civitai.com`:
+
+| Written as | Also matches |
+|---|---|
+| `https://civitai.com/` | trailing slash is ignored |
+| `HTTPS://CIVITAI.COM` | scheme and host are case-insensitive |
+| `https://civitai.com:443`, `http://x:80` | an explicit **default** port is ignored |
+| `https://пример.com` | normalised to the punycode a browser reports |
+
+These stay **significant** — they are different origins, not spellings:
+
+- a **non-default** port: `https://civitai.com:8443` does not match `https://civitai.com`
+- the scheme: `http://` never matches `https://`
+- a trailing-dot host: `https://civitai.com.` is its own origin
+- any host that merely *contains* an allowed one: `https://civitai.com.evil.com`
+  never matches `https://civitai.com`
+
+An entry that is not a bare origin **throws at construction** rather than being
+quietly skipped — no scheme (`civitai.com`), a path/query/fragment
+(`https://civitai.com/embed`), credentials (`https://u:p@civitai.com`), or a
+scheme with no origin of its own (`file://…`). A silently dropped entry is the
+failure this rule exists to prevent: the allowlist would be missing an origin
+you believe is on it.
+
+If `BLOCK_INIT` never lands, the 10s timeout error names the origins that
+actually arrived and were rejected, next to the allowlist it checked them
+against — start there.
+
+## The `/testing` subexport
+
+`@civitai/blocks-react/testing` is the **host-simulation** entry point: it stands
+in for civitai.com so your block can run in `vitest`/`happy-dom` and in a local
+dev harness. It is a normal, published subpath of a `0.x` package — see
+[Stability](#stability-of-testing) below for exactly what that does and does not
+promise.
+
+**Everything on this subpath is a mock.** No network, no Buzz, no real backend.
+Until `0.55.0` that was not true: `createLiveHost`, which talks to the real
+Civitai backend and spends the token holder's own Buzz, was exported from here
+too, one autocomplete entry from `createMockHost`. It now lives on its own
+subpath — see [The `/live` subexport](#the-live-subexport) below.
+
+### The whole surface
+
+This section is **the one place the surface is written down**, and it is not
+prose: `test/subpathSurfaces.test.ts` parses the two marked regions below and
+fails if they disagree with what `src/testing.tsx` actually exports — in either
+direction. Every other mention of this subpath (module docblock, `AGENTS.md`)
+points here rather than repeating the list, because a second copy is exactly
+what went stale in [#334](https://github.com/civitai/civitai-app-starters/issues/334).
+
+**Values**
+
+<!-- TESTING-SURFACE:VALUES:BEGIN -->
+
+| Export | What it is |
+|---|---|
+| `resetTransport` | Drops the cached singleton transport. Call it in `beforeEach` so each test starts clean. |
+| `createMockHost` | A framework-agnostic fake of the embedding host — answers every `*_RESULT` message, with knobs for generation cost/latency/failure, Buzz balance, app + shared storage, consent, maturity. Returns a `MockHost`; call `.install()` and keep the returned teardown. **No network, no Buzz.** |
+| `readMockHostUrlOptions` | Reads the harness URL toggles (`?viewer` `?consent` `?fail` `?theme` `?pick` `?balance` `?latency` `?seed` …) into a `Partial<MockHostOptions>`. `Harness` applies it for you; call it directly only in a hand-rolled harness. |
+| `Harness` | The React wrapper: installs a `createMockHost` on mount, tears it down on unmount, and renders an optional on-screen outbound-message log. Takes every `MockHostOptions` field plus `applyUrlToggles` and `showLog`. |
+
+<!-- TESTING-SURFACE:VALUES:END -->
+
+**Types** — the transitive closure that makes those values nameable: each is the
+declared type of an option, of a `MockHost` member, or of a property of one of
+those, so you can hoist a sub-object out of an options literal and give it a
+type.
+
+<!-- TESTING-SURFACE:TYPES:BEGIN -->
+
+```text
+CannedPick
+CostSpec
+HarnessProps
+ImageSpec
+MockBuzzBalance
+MockBuzzHandle
+MockBuzzScenario
+MockCannedImageScan
+MockGenerationScenario
+MockHost
+MockHostFailMode
+MockHostOptions
+MockHostScenarioPatch
+MockSharedScenario
+MockSharedSeed
+MockStorageScenario
+```
+
+<!-- TESTING-SURFACE:TYPES:END -->
+
+That is the complete list. Nothing else is exported.
+
+### In a test
+
+```ts
+import {
+  createMockHost,
+  resetTransport,
+  type MockHostOptions,
+  type MockGenerationScenario,
+} from '@civitai/blocks-react/testing';
+
+resetTransport();
+
+// Hoisting a sub-object out of the options literal is why the scenario types
+// are exported.
+const generation: MockGenerationScenario = { costPerGen: 12, latencyMs: 0 };
+const options: MockHostOptions = { viewer: null, failMode: 'some', generation };
+
+const host = createMockHost(options);
+const uninstall = host.install();
+host.setScenario({ failMode: 'none' });   // live-tune mid-test
+uninstall();
+```
+
+### In a dev harness
+
+```tsx
+import { Harness } from '@civitai/blocks-react/testing';
+
+export function DevRoot() {
+  return (
+    <Harness failMode="some" showLog>
+      <App />
+    </Harness>
+  );
+}
+```
+
+`<Harness>` fires host messages from `window.location.origin`, and the transport
+drops inbound messages from origins outside its allowlist — so a dev harness
+must include its own origin, e.g. `VITE_BLOCK_ALLOWED_PARENT_ORIGINS=http://localhost:5173`.
+Otherwise `BLOCK_INIT` never lands.
+
+### Stability of `/testing`
+
+[#334](https://github.com/civitai/civitai-app-starters/issues/334) offered a
+fork: *document the undocumented surface*, **or** *mark the subpath explicitly
+unstable*. This package took the **first** branch, and only the first. The
+section above is that documentation.
+
+Concretely, and with no guarantee beyond what is actually enforced:
+
+- **It is a normal subpath of a `0.x` package**, on the same footing as `.`,
+  `./ui` and `./live` — no stronger, no weaker. Under semver `0.x`, a **minor
+  may break it**. It is not `@internal`, and it is not "unsupported": fleet
+  blocks import it from their dev harnesses and from their test suites.
+- **What is enforced** is that a change to the exported *symbol set* cannot ship
+  silently. `test/subpathSurfaces.test.ts` fails on growth and on shrinkage, and
+  it fails again unless the README section above is updated to match — so any
+  such change is a deliberate edit that a reviewer sees and a changeset names.
+- **What is *not* promised** is the *shape* of the mock-host option and result
+  types. They describe a fake host whose fidelity tracks the real one; a
+  property may be added, tightened or renamed in a minor. The ledger asserts
+  names, not shapes, and deliberately so.
+
+What is *not* listed above is genuinely internal and carries no guarantee. Until
+`0.55.0` this subpath also re-exported 25 symbols with no documentation — the
+catalog client (`fetchCatalog`, `buildCatalogUrl`, `edgeThumb`, `modelToCard`,
+`DEFAULT_LIMIT`, …), the in-harness picker overlay (`openPickerOverlay`),
+`decodeBlockTokenPayload`, `disallowedAccountError`, `mockParentMessage`, and
+the `MockHostProvider` alias — plus `createLiveHost` / `LiveHostOptions`, which
+moved to `./live` rather than disappearing. See the `0.55.0` changelog entry for
+the full list and for the three removals that had a measured fleet consumer. If
+you were importing one of the internal ones, it lives at a path this package
+does not publish — open an issue rather than reaching into `dist/internal/`.
+
+## The `/live` subexport
+
+> ### 🔴 `@civitai/blocks-react/live` spends real Buzz
+>
+> `createLiveHost` forwards the App-Block postMessage protocol to the **real
+> Civitai backend** over a pasted short-lived dev block token —
+> `blocks.submitWorkflow` included — and a successful generation **debits the
+> token holder's own Buzz**. There is no dry-run mode and no confirmation. It
+> exists for one caller: a `pnpm dev:live` harness. **It must never appear in a
+> test suite.** The free one is `createMockHost`, on `./testing`.
+
+### The whole surface
+
+One value and one type. `test/subpathSurfaces.test.ts` pins the runtime export
+set, failing on growth and on shrinkage.
+
+| Export | What it is |
+|---|---|
+| `createLiveHost` | 🔴 **Real backend, real Buzz.** Installs a host that proxies the block's `postMessage` traffic to civitai.com using a dev block token. Returns a handle; call `.install()` and keep the teardown, exactly like `createMockHost`. |
+| `LiveHostOptions` *(type)* | Options for the above. `blockToken` is required; everything else (`backendBaseUrl`, `viewer`, `theme`, `context`, `onOutbound`, …) has a default. |
+
+### In a `dev:live` harness
+
+```ts
+import { createLiveHost, type LiveHostOptions } from '@civitai/blocks-react/live';
+
+// The token is a SHORT-LIVED dev block token pasted into the harness env, never
+// an API key: `POST /api/v1/blocks/dev-token`, ~4h, re-minted by hand.
+const options: LiveHostOptions = {
+  blockToken: devBlockToken,
+  theme: 'dark',
+};
+
+const host = createLiveHost(options);
+const uninstall = host.install();
+```
+
+### Stability of `/live`
+
+The same terms as `./testing`: a normal subpath of a `0.x` package where a minor
+may break it, with the runtime symbol set pinned by
+`test/subpathSurfaces.test.ts` so it cannot change silently.
+
+It moved off `./testing` in `0.55.0`: an import path named `testing` asserts the
+opposite of what this module does, and the import line is the one piece of context
+that travels with every call site.
+
+🔴 One cost worth stating plainly: publishing and documenting this subpath makes
+[#334](https://github.com/civitai/civitai-app-starters/issues/334) **item 3** —
+getting the live-host code out of the tarball entirely — *harder*, not easier.
+`./live` is now a named public entry point, so removing it later is a breaking
+change on a surface consumers pin against, where before it was one export among
+many on a subpath nobody was told to rely on.
+
+## What the host-simulation subpaths cost you
+
+The `dist/` modules reachable only from `./testing` and `./live`, and from nothing
+under `.` or `./ui`, **ship in every install**, production dependency trees
+included. They are tree-shaken out of application *bundles* — no block ships a
+mock host to a browser — so this is `node_modules` weight, not bundle weight.
+
+`files` is `["dist", "README.md"]` and `tsconfig` compiles all of `src/**/*`, so
+the `exports` map has no bearing whatsoever on tarball contents; it decides only
+what a consumer can *name*.
+**The `/live` split buys safety, not size.** Moving these bytes needs the code
+deleted or published as a second artifact; that is
+[#334](https://github.com/civitai/civitai-app-starters/issues/334) item 3, and it
+is not done here.
+
+## Examples
+
+Runnable, minimal blocks — one per feature, each with its own README:
+
+- [`hello-world`](https://github.com/civitai/civitai-app-starters/tree/main/starters/examples/hello-world) — `useBlockContext`, lifecycle, `data-theme` (#60)
+- [`settings`](https://github.com/civitai/civitai-app-starters/tree/main/starters/examples/settings) — manifest settings + `SettingsForm`
+- [`buzz-workflow`](https://github.com/civitai/civitai-app-starters/tree/main/starters/examples/buzz-workflow) — `useBuzzWorkflow` (#59, #8/#9/#10, #19)
+- [`kv-storage`](https://github.com/civitai/civitai-app-starters/tree/main/starters/examples/kv-storage) — `useAppStorage`
+- [`scopes-api`](https://github.com/civitai/civitai-app-starters/tree/main/starters/examples/scopes-api) — scopes + REST + `useBlockToken`
+- [`buzz-purchase`](https://github.com/civitai/civitai-app-starters/tree/main/starters/examples/buzz-purchase) — `useBuzzPurchase`
+
+## Version compatibility
+
+| `@civitai/blocks-react` | pairs with `@civitai/app-sdk` | adds |
+|---|---|---|
+| `0.50.x` | `^0.40.0` | `useCreatePostFromApp()` (`CREATE_POST_FROM_APP`) + the `posts:write:self` scope. Pairing `0.50.x` with an SDK below `0.40.0` fails at `tsc` with `Cannot find name 'BlockCreatePostHostError'`, not at install. |
+| `0.48.x` | `^0.38.0` | `useCollectionFollow()` + `<FollowButton>` / `<TipButton>` (`SET_COLLECTION_FOLLOW`). Pairing `0.48.x` with an SDK below `0.38.0` fails at `tsc` with `Cannot find name 'BlockCollectionFollowErrorCode'`, not at install — the floor those releases declared was deliberately wide (#206 — a per-minor floor forced a major on consumers). |
+| `0.36.x` | `^0.27.0` | auto-installs the SDK's opaque-origin web-storage shim (`@civitai/app-sdk/safe-storage`) on import |
+| `0.29.x` | `^0.24.0` | `useAppWorkflows()` — app generator subqueue read + cancel (`QUERY_APP_WORKFLOWS` / `CANCEL_APP_WORKFLOW`) |
+| `0.27.x`–`0.28.x` | `^0.23.0` | async-scan image upload; transport validators for all `SHARED_*` / `APP_STORAGE_*` / picker replies |
+| `0.26.x` | `^0.22.0` | `useViewer()` (`GET_VIEWER`) |
+| `0.25.x` | `^0.21.0` | `useBuzzTransactions`, `useBuzzAccounts`, `useDailyCompensation`, `useWildcardPack` |
+| `0.5.0` | `^0.7.0` | `useBuzzWorkflow().cancel()` (real server-side cancel, gotcha #51) |
+| `0.4.x` | `^0.6.0` | `useAppStorage`, `SettingsForm` (`/ui`) |
+| `0.3.x` | `^0.5.0` | earlier hook set |
+
+Always keep `@civitai/app-sdk` at or above the paired minor — the React package
+peer-depends on the SDK's message/type contract.
+
+## License
+
+MIT — see [`LICENSE`](../../LICENSE).
