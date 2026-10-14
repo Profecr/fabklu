@@ -1,0 +1,57 @@
+docs/working/
+
+node_modules/
+dist/
+build/
+
+# Generated package-root styles.css copies (built from dist by the package build
+# writers so a literal CDN path @civitai/<pkg>/styles.css resolves on jsDelivr,
+# which ignores package.json `exports`). Build artifacts — shipped via `files`,
+# not committed.
+packages/civitai-theme/styles.css
+packages/civitai-components/styles.css
+packages/civitai-components/elements.js
+packages/civitai-components/site-elements.js
+.next/
+.svelte-kit/
+.vercel/
+.turbo/
+.cache/
+coverage/
+
+.env
+.env.local
+.env.*.local
+
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Nix / direnv
+.direnv/
+result
+result-*
+
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/settings.json.example
+
+.claude/settings.local.json
+
+*.tsbuildinfo
+.eslintcache
+
+# Scratch dir for scripts/typecheck-readme-snippets.mjs (auto-cleaned; ignored
+# in case a run is interrupted mid-flight).
+.readme-snippets-tmp/
+
+# Vitest browser-mode screenshot attachments (transient)
+.vitest-attachments/
+# Vitest browser-mode FAILURE screenshots, written next to the failing spec
+# (`test/__screenshots__/<spec>/<test-name>.png`). Transient debug output — the
+# sibling of the attachments dir above, which was ignored while this one was not.
+**/test/__screenshots__/
