@@ -1,0 +1,62 @@
+{
+  "name": "civitai-svelte-pwa-starter",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Vite + Svelte 5 (no Kit) PWA starter (with Hono BFF) for building Civitai OAuth + Buzz-powered apps.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "civitai",
+    "oauth",
+    "pkce",
+    "starter",
+    "template",
+    "vite",
+    "svelte",
+    "pwa",
+    "hono",
+    "bff",
+    "ai",
+    "generation"
+  ],
+  "homepage": "https://github.com/civitai/civitai-app-starters/tree/main/starters/svelte-pwa#readme",
+  "bugs": "https://github.com/civitai/civitai-app-starters/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/civitai/civitai-app-starters.git",
+    "directory": "starters/svelte-pwa"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build && tsc -p tsconfig.server.json",
+    "start": "node --env-file=.env dist-server/index.js",
+    "typecheck": "svelte-check --tsconfig ./tsconfig.json && tsc -p tsconfig.server.json --noEmit",
+    "check:env": "node scripts/check-env.mjs",
+    "preview": "vite preview",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "test:e2e:install": "playwright install --with-deps chromium"
+  },
+  "dependencies": {
+    "@civitai/app-sdk": "^0.2.0",
+    "@hono/node-server": "^2.0.4",
+    "@t3-oss/env-core": "^0.13.0",
+    "hono": "^4.12.23",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@hono/vite-dev-server": "^0.26.0",
+    "@playwright/test": "^1.57.0",
+    "@sveltejs/vite-plugin-svelte": "^7.0.4",
+    "@tailwindcss/vite": "^4.0.0",
+    "@tsconfig/svelte": "^5.0.4",
+    "@types/node": "^25.9.1",
+    "svelte": "^5.55.10",
+    "svelte-check": "^4.4.0",
+    "tailwindcss": "^4.3.0",
+    "tslib": "^2.6.2",
+    "typescript": "^5.9.2",
+    "vite": "^8.0.14",
+    "vite-plugin-pwa": "^1.1.0"
+  }
+}
