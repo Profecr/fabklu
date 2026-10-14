@@ -62,7 +62,7 @@
   },
   "devDependencies": {
     "@civitai/sdk": "workspace:*",
-    "@types/node": "^25.9.1",
+    "@types/node": "^26.6.5",
     "jsdom": "^25.0.0",
     "lit": "^3.3.3",
     "typescript": "^5.9.2",
