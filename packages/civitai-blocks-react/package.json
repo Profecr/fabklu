@@ -56,7 +56,7 @@
   "devDependencies": {
     "@civitai/app-sdk": "workspace:^",
     "@testing-library/react": "^16.0.0",
-    "@types/node": "^25.9.1",
+    "@types/node": "^26.6.5",
     "@types/react": "^19.2.15",
     "@vitest/browser": "4.1.11",
     "@vitest/browser-playwright": "4.1.11",
