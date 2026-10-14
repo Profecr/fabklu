@@ -1,0 +1,67 @@
+/**
+ * `@civitai/app-sdk/blocks` — framework-agnostic contract for Civitai Apps.
+ *
+ * This subpath exports the manifest type, scope strings, postMessage protocol,
+ * and the `defineBlock` validator. Hooks and transport implementations live in
+ * a separate package (see `@civitai/blocks-react`) so this module stays usable
+ * from any runtime — Node, browsers, workers — with no React dependency.
+ */
+
+export { defineBlock, BlockManifestError } from './defineBlock.js';
+export type { DefineBlockConfig } from './defineBlock.js';
+
+export { BLOCK_SCOPES, BLOCK_SCOPE_PATTERN, BLOCK_CATEGORIES } from './scopes.js';
+export type { BlockScope, BlockScopeKey, BlockCategory } from './scopes.js';
+
+export {
+  BrowsingLevel,
+  SFW_LEVELS,
+  NSFW_LEVELS,
+  isSfwCeiling,
+  isLevelAllowed,
+} from './browsingLevel.js';
+export type { BrowsingLevelKey, BrowsingLevelBit, ColorDomain } from './browsingLevel.js';
+
+export { isMessage } from './messages.js';
+export type {
+  BlockInitPayload,
+  BlockToParentMessage,
+  BlockToParentMessageType,
+  ParentToBlockMessage,
+  ParentToBlockMessageType,
+  SharedStorageItemWire,
+  SharedStorageValue,
+  WrappedToken,
+} from './messages.js';
+
+export type {
+  BlockContext,
+  BlockManifest,
+  BlockManifestV1,
+  BlockSettings,
+  BlockToken,
+  ContentRating,
+  ManifestAsset,
+  ManifestBooleanField,
+  ManifestIframe,
+  ManifestNumberField,
+  ManifestPreview,
+  ManifestSettingField,
+  ManifestSettings,
+  ManifestStringField,
+  ManifestTarget,
+  ModelSlotContext,
+  SettingScope,
+  SettingWidget,
+  Theme,
+  ViewerInfo,
+  BlockCheckpointInfo,
+  BlockResourceInfo,
+  BlockResourcePickerType,
+  BlockTextToImageParams,
+  BlockWorkflowSnapshot,
+  BuzzAccountType,
+  ShowcaseImage,
+  WorkflowBody,
+  WorkflowStatus,
+} from './types.js';
