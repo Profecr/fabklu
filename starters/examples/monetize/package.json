@@ -34,13 +34,13 @@
   "dependencies": {
     "@civitai/app-sdk": "^0.69.1",
     "@civitai/blocks-react": "^0.72.4",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",
-    "@types/react": "^19.2.15",
-    "@types/react-dom": "^19.0.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.0.2",
     "ajv": "^8.17.1",
     "typescript": "^5.9.2",
