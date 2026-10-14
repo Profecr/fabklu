@@ -1,0 +1,42 @@
+{
+  "$schema": "https://civitai.com/schemas/app-block/v1.json",
+  "blockId": "buzz-workflow-demo",
+  "version": "0.1.0",
+  "name": "Buzz Workflow Demo",
+  "type": "block",
+  "targets": [
+    {
+      "slotId": "model.sidebar_top",
+      "priority": 100,
+      "requiredContext": ["modelId", "modelVersionId"]
+    }
+  ],
+  "scopes": ["models:read:self", "ai:write:budgeted"],
+  "scopeJustifications": {
+    "ai:write:budgeted": "Runs text-to-image generations on this model for the viewer, spending the viewer's Buzz up to the per-generation budget the installer sets."
+  },
+  "settings": {
+    "buzz_budget_per_gen": {
+      "scope": "publisher",
+      "type": "number",
+      "widget": "number",
+      "label": "Max Buzz per generation",
+      "description": "Safety ceiling on what one generation may cost. The host signs it into the block token as buzzBudget and refuses any submit priced above it.",
+      "default": 500,
+      "min": 1,
+      "max": 1000,
+      "requires_scope": "ai:write:budgeted"
+    }
+  },
+  "bootSkeleton": true,
+  "iframe": {
+    "minHeight": 400,
+    "maxHeight": 1200,
+    "resizable": true,
+    "sandbox": "allow-scripts allow-forms"
+  },
+  "contentRating": "pg",
+  "minApiVersion": "1.0",
+  "buildCommand": "npm run build",
+  "outputDir": "dist"
+}
