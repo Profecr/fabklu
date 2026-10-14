@@ -1,0 +1,403 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://civitai.com/schemas/app-block/v1.json",
+  "title": "Civitai App Block Manifest",
+  "description": "THE canonical, server-published schema for block.manifest.json — the ONLY mandatory file in a Civitai App Block. Published at https://civitai.com/schemas/app-block/v1.json. This is the single source of truth for the block manifest contract: the platform's server-side validator (src/server/services/block-manifest-validator.service.ts) and the `civitai` CLI both validate against these same rules. Set this URL as your manifest's `$schema` for editor validation.",
+  "type": "object",
+  "required": ["blockId", "version", "name", "contentRating", "scopes"],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional JSON-Schema reference; ignored by the platform validator."
+    },
+    "blockId": {
+      "type": "string",
+      "description": "The block slug. Becomes the canonical submission slug. Lowercase, starts with a letter, hyphen-separated, 3-40 chars.",
+      "minLength": 3,
+      "maxLength": 40,
+      "pattern": "^[a-z][a-z0-9-]*[a-z0-9]$"
+    },
+    "version": {
+      "type": "string",
+      "description": "Semantic version (x.y.z, optional -prerelease).",
+      "minLength": 1,
+      "pattern": "^\\d+\\.\\d+\\.\\d+(-[0-9A-Za-z.-]+)?$"
+    },
+    "name": {
+      "type": "string",
+      "description": "Human-readable display name. The server only requires a non-empty string (no length cap), so the CLI does not impose one either.",
+      "minLength": 1
+    },
+    "tagline": {
+      "type": "string",
+      "description": "Optional one-line pitch shown under the app's name on its `/apps` store card + detail page. Manifest-governed: it flows to the store listing on moderator-approve and is re-synced from the manifest on every subsequent approved version. Omit it and the store simply shows no tagline. Must contain a non-whitespace character and is capped at 140 characters — the same bound off-site listings use (OFFSITE_TAGLINE_MAX), kept in lockstep with MANIFEST_TAGLINE_MAX_LENGTH in src/server/services/block-manifest-validator.service.ts (a drift-guard test enforces equality). NOTE: the server measures the TRIMMED length, while this maxLength counts the raw string — so a value padded past 140 is rejected here but accepted server-side. That asymmetry is deliberate and one-directional: this schema is never more permissive than the server, so local validation can't green-light something submit would reject.",
+      "minLength": 1,
+      "maxLength": 140,
+      "pattern": "\\S"
+    },
+    "repository": {
+      "type": "string",
+      "description": "Optional PUBLIC SOURCE-REPOSITORY link for an open-source app, rendered as a `Source` row on the app's `/apps` store DETAIL page (never on a store grid card). Manifest-governed: it flows to the store listing on moderator-approve and is re-synced from the manifest on every subsequent approved version; remove the key and the link is cleared. This is NOT your app's internal Civitai repository — it is a link you publish. Must be an `https://` URL, carrying no embedded credentials and no port, whose host is EXACTLY one of github.com, gitlab.com or codeberg.org (an exact-host allowlist — `www.github.com`, `gist.github.com` and `raw.githubusercontent.com` are all rejected), and whose path is exactly `/<owner>/<repo>`, the repository ROOT (a deep link such as `/owner/repo/tree/main` is rejected). A trailing `/` or `.git`, a query string and a fragment are accepted and STRIPPED — the stored value is normalised to `https://<host>/<owner>/<repo>`. Capped at 200 characters, kept in lockstep with MAX_REPOSITORY_URL_LENGTH in src/server/schema/blocks/external-app.schema.ts (a drift-guard test enforces equality, and enforces that this description names exactly the hosts REPOSITORY_HOST_ALLOWLIST contains). NOTE: as with `tagline`, the server measures the TRIMMED string while this maxLength counts the raw one, so the LENGTH bound here is never looser than the server's. The `pattern`, however, is a coarse SHAPE check and NOT the whole rule, so unlike `tagline` this field CAN pass local validation and still be rejected at submit. The server additionally requires each of the two path segments to begin with an ASCII letter or digit and to contain only letters, digits, `.`, `-` and `_`, and it strips a trailing `.git` BEFORE applying that test. Values such as a repository segment that is only `.git`, one starting with a dash, one containing a percent-escape, and one containing a non-ASCII character all match this pattern and are refused by the server. The pattern is deliberately left coarse rather than tightened: the CLI and the starter templates byte-mirror this file, and a stricter regex would be a compatibility change for every vendored copy. Treat passing local validation as necessary, not sufficient — `validateRepositoryUrl` in src/server/schema/blocks/external-app.schema.ts is authoritative.",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^https://(github\\.com|gitlab\\.com|codeberg\\.org)/[^/]+/[^/]+/?$"
+    },
+    "type": {
+      "type": "string",
+      "description": "Free-form descriptor used by some examples (e.g. \"block\"). Not validated by the platform.",
+      "enum": ["block"]
+    },
+    "contentRating": {
+      "type": "string",
+      "description": "Content rating of the app surface.",
+      "enum": ["g", "pg", "pg13", "r", "x"]
+    },
+    "category": {
+      "type": "string",
+      "description": "Optional marketplace category for the app's `/apps` store listing. When present it flows to the listing automatically on moderator-approve (only when a moderator has not already curated a category). Omit to let a moderator categorise the app. Must be one of the known marketplace categories — this enum is kept in lockstep with MARKETPLACE_CATEGORIES in src/server/services/blocks/marketplace-categories.constants.ts (a drift-guard test enforces equality).",
+      "enum": [
+        "generation",
+        "games",
+        "utility",
+        "discovery",
+        "moderation",
+        "analytics",
+        "other"
+      ]
+    },
+    "renderMode": {
+      "type": "string",
+      "description": "How the block renders. Defaults to \"iframe\". \"inline\"/\"hybrid\" require a verified/internal trust tier (server-assigned), so authors should leave this as iframe.",
+      "enum": ["iframe", "inline", "hybrid"]
+    },
+    "auth": {
+      "type": "string",
+      "description": "Which credential the host hands the block: \"block-token\" (default when omitted) is the block-scoped JWT; \"oauth\" asks for an opaque OAuth access token for the block's own OauthClient, which ordinary /api/v1 routes accept as a viewer bearer. Minting it is gated on a server flag that is not generally enabled, and also requires a signed-in viewer and a declared \"user:read:self\" scope; when any of those is unmet the host hands back a block JWT instead of failing, so branch on the token kind the host reports rather than on this field. An OAuth token is refused by the postMessage bridge procedures, which verify a block JWT only, and declaring \"oauth\" alongside any \"apps:storage:*\" scope is refused at submit time.",
+      "enum": ["block-token", "oauth"]
+    },
+    "trustTier": {
+      "type": "string",
+      "description": "SERVER-OWNED. Do NOT set this in your manifest — the platform assigns the trust tier during review. Present here only to reject dev-set values.",
+      "$comment": "Rejected via 'not' below.",
+      "enum": ["unverified", "verified", "internal"]
+    },
+    "scopes": {
+      "type": "array",
+      "description": "Capabilities the block requests. Must be a strict subset of what review grants. Each scope is lowercase colon-separated.",
+      "items": {
+        "type": "string",
+        "enum": [
+          "models:read:self",
+          "user:read:self",
+          "ai:write:budgeted",
+          "buzz:read:self",
+          "social:tip:self",
+          "apps:storage:read",
+          "apps:storage:write",
+          "apps:storage:shared:read",
+          "apps:storage:shared:write",
+          "collections:read:self",
+          "collections:write:self",
+          "collections:read:private",
+          "posts:write:self",
+          "goods:read:self",
+          "goods:purchase:self",
+          "apps:store:items:write"
+        ]
+      }
+    },
+    "scopeJustifications": {
+      "type": "object",
+      "description": "Per-scope justification: a map of scope-id → free-text rationale explaining WHY the app needs that permission, shown to the moderator during review. REQUIRED for SENSITIVE scopes — any declared scope that can spend or read the viewer's Buzz, read the viewer's private data, or write data other users see (e.g. `ai:write:budgeted`, `social:tip:self`, `goods:purchase:self`, `buzz:read:self`, `collections:read:private`, `apps:storage:shared:write`, `posts:write:self`, `apps:store:items:write`) MUST carry a non-empty justification here, or the manifest is rejected at submit time. OPTIONAL for non-sensitive scopes — omit those and the manifest stays valid. Every key MUST be a scope also present in `scopes` (justifications for scopes you don't request are rejected). Each value is a non-empty string of at most 500 characters. The requirement is enforced imperatively by the manifest validator (not expressed as JSON-Schema conditionals here). NOTE: the justification captures the developer's STATED rationale only; the platform does not verify the truth of the claims.",
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 500
+      }
+    },
+    "minApiVersion": {
+      "type": "string",
+      "description": "Minimum App SDK API version the block targets (informational).",
+      "pattern": "^\\d+(\\.\\d+)*$"
+    },
+    "buildCommand": {
+      "type": "string",
+      "description": "Config-as-code: command the platform runs to build the static bundle. Must be one of an allowlisted set of build invocations (defense-in-depth against shell injection): \"npm run <script>\", \"pnpm run <script>\", \"yarn run <script>\" (where <script> is a package.json script name), \"vite build\", or \"npx vite build\". Omit for no-build (static) apps. When set, outputDir must also be set. The pattern and max length are kept in lockstep with BUILD_COMMAND_RE / BUILD_COMMAND_MAX_LENGTH in src/server/services/block-manifest-validator.service.ts (a drift-guard test enforces equality).",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^(?:(?:npm|pnpm|yarn) run [a-zA-Z0-9:_-]+|(?:npx )?vite build)$"
+    },
+    "outputDir": {
+      "type": "string",
+      "description": "Config-as-code: directory (relative to the project root) the buildCommand emits static files into (e.g. \"dist\"). Must be a safe relative path \u2014 no leading \"/\", no \"..\" path traversal, no backslash separators, and no Windows drive prefix (e.g. C:). Required when buildCommand is set. Kept in lockstep with the outputDir checks in src/server/services/block-manifest-validator.service.ts (a drift-guard test enforces equality). (The server additionally rejects a NUL byte; that impossible-in-a-manifest case is intentionally omitted here for RE2 regex portability.)",
+      "minLength": 1,
+      "maxLength": 256,
+      "allOf": [
+        { "$comment": "no leading '/' (absolute path)", "not": { "pattern": "^/" } },
+        { "$comment": "no backslash separators (Windows / '\\..' traversal)", "not": { "pattern": "\\\\" } },
+        { "$comment": "no '..' path-traversal segment", "not": { "pattern": "(^|/)\\.\\.(/|$)" } },
+        { "$comment": "no Windows drive prefix (e.g. C:)", "not": { "pattern": "^[A-Za-z]:" } }
+      ]
+    },
+    "publicSettingsKeys": {
+      "type": "array",
+      "description": "Allowlist of settings keys exposed to anonymous viewers. Default (omitted) = none exposed.",
+      "maxItems": 32,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64
+      }
+    },
+    "assetBundleUrl": {
+      "type": "string",
+      "description": "Optional v2 surface — HTTPS URL to a hosted asset bundle. Must be a public https URL.",
+      "format": "uri",
+      "pattern": "^https://"
+    },
+    "iframe": {
+      "type": "object",
+      "description": "iframe envelope. NOTE: iframe.src is SERVER-OWNED — do NOT set it; the platform stamps the canonical bundle URL during build/approve.",
+      "additionalProperties": false,
+      "properties": {
+        "src": {
+          "description": "SERVER-OWNED. Do NOT set iframe.src — the platform assigns it. Present here only so the schema can reject dev-set values.",
+          "$comment": "Rejected via 'not' below."
+        },
+        "minHeight": {
+          "type": "integer",
+          "description": "Minimum iframe height in px.",
+          "minimum": 40,
+          "maximum": 4000
+        },
+        "maxHeight": {
+          "description": "Maximum iframe height in px, or null for unbounded.",
+          "type": ["integer", "null"],
+          "minimum": 40,
+          "maximum": 4000
+        },
+        "resizable": {
+          "type": "boolean",
+          "description": "Whether the host honours RESIZE_IFRAME messages."
+        },
+        "sandbox": {
+          "type": "string",
+          "description": "Space-separated iframe sandbox tokens. Unverified tier allows only: allow-scripts, allow-forms. Never combine allow-same-origin with allow-scripts.",
+          "minLength": 1
+        }
+      }
+    },
+    "bootSkeleton": {
+      "type": "boolean",
+      "default": false,
+      "description": "The app's shipped index.html paints its own loading state inside #root. The full-page run host then stands down its own branded overlay and shows the iframe from mount, so the app's boot state is visible at first paint and its own render replaces it in place with no cross-fade and no reveal transform. Omit (or false) unless the app really ships one: with the overlay stood down, an empty #root is a blank iframe for the whole load. To paint in the HOST's theme rather than guessing from prefers-color-scheme, the app must also be enabled for the BLOCK_INIT URL fragment and read it before first paint; without that the theme is a guess that can disagree with the host and be corrected on BLOCK_INIT.",
+      "$comment": "Honoured by the full-page run host. Other block surfaces ignore it."
+    },
+    "page": {
+      "type": "object",
+      "description": "Full-page surface descriptor (W10). Page apps mount at /apps/run/<slug>.",
+      "additionalProperties": false,
+      "required": ["path", "title"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Sub-path the page mounts at; must start with '/'.",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^/"
+        },
+        "title": {
+          "type": "string",
+          "description": "Title shown in host chrome.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "icon": {
+          "type": "string",
+          "description": "Optional icon name.",
+          "maxLength": 128
+        },
+        "buzzBudgetPerGen": {
+          "type": "integer",
+          "description": "Optional per-generation Buzz SAFETY CEILING for `ai:write:budgeted` tokens — the most a SINGLE generation this app requests is allowed to cost. It is a ceiling against a malicious or compromised app draining the viewer's Buzz, NOT a cost forecast: size it WELL ABOVE your worst-case generation (a good rule of thumb is several times your expected cost — e.g. 1000 when a run costs ~100), never at your estimate. Setting it to an estimate is the common mistake. The server re-prices every submit and compares that real price against this budget BEFORE anything runs, so a generation that comes in over budget is REJECTED outright with `insufficient buzz budget` — no workflow is created and no Buzz is spent, but the user gets nothing, and it stays broken for EVERY user until you ship a new manifest version and it is re-approved. So any upward drift in real cost (more steps, a bigger resolution, a pricier model or recipe, a colder cache) turns a budget sized to today's estimate into a hard outage. Positive integer. Omit it and the token is minted with a 10 Buzz default, which is below almost any real generation. Server-clamped to the platform per-gen cap (1000 today), so a generous value is safe. This bounds ONE generation only — cumulative spend is separately capped per viewer per day and per app, so a high per-gen ceiling does not widen total exposure.",
+          "exclusiveMinimum": 0
+        }
+      }
+    },
+    "goods": {
+      "type": "array",
+      "description": "Optional DIGITAL GOODS catalog — entitlements the platform sells to a viewer on your app's behalf, for Buzz. Manifest-governed and REVIEW-GATED: the catalog a moderator approves is the catalog that can be sold, and changing a price means shipping a new version and being re-reviewed. The platform owns the ledger (who bought what, when, at what price, and its refund state); the good's MEANING is your app's business — read the viewer's entitlements from GET /api/v1/blocks/entitlements and keep the semantics in your own app storage. Declaring goods does not by itself let you sell: the app must also declare the `goods:purchase:self` scope (and `goods:read:self` to read entitlements back), and the viewer must consent. Sales split platform 30% / app owner 70%, paid immediately. Kept in lockstep with the bounds in src/shared/constants/block-goods.constants.ts (a drift-guard test enforces equality); the imperative validator in that same module is authoritative.",
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "title", "priceBuzz"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Stable identifier for this good, unique within the manifest. This is what a purchase and an entitlement are keyed by, so changing it in a later version orphans every entitlement already granted under the old id. Lowercase letters, digits, - and _, starting with a letter or digit.",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[a-z0-9][a-z0-9_-]*$"
+          },
+          "title": {
+            "type": "string",
+            "description": "Human-readable name shown to the viewer at purchase. Non-empty; the server measures the TRIMMED length, so this maxLength is never more permissive than the server.",
+            "minLength": 1,
+            "maxLength": 80
+          },
+          "description": {
+            "type": "string",
+            "description": "Optional one-paragraph explanation of what the viewer gets.",
+            "maxLength": 500
+          },
+          "priceBuzz": {
+            "type": "integer",
+            "description": "Price in whole Buzz. Buzz has no sub-unit, so this must be a whole number, and the minimum is 2 rather than 1 because the app owner's 70% share is floored — a 1 Buzz item would earn its owner nothing, permanently. Capped so a single purchase can never drain an account; a viewer also has a daily ceiling across every app they have installed, so a purchase can be refused with a clean 4xx even at a legal price. Both bounds are kept in lockstep with BLOCK_GOOD_MIN_PRICE_BUZZ / BLOCK_GOOD_MAX_PRICE_BUZZ in src/shared/constants/block-goods.constants.ts by a drift-guard test. \u26a0\ufe0f THE MAXIMUM HERE IS THE WIDEST ANY KIND MAY CHARGE, NOT THE LIMIT FOR YOUR GOOD: a good with kind \"app_unlock\" is capped at 5000 Buzz by the platform validator, which this schema deliberately does not restate (it declares that validator authoritative). See the `kind` description. A value above that validates offline and is rejected at submit.",
+            "minimum": 2,
+            "maximum": 50000
+          },
+          "kind": {
+            "type": "string",
+            "description": "What the entitlement grants, from the platform's point of view. \"good\" (the default) is an ordinary in-app purchase the platform records and does not interpret. \"app_unlock\" marks a one-time unlock of the app itself; the ACCESS GATE is a later change that will read this value, so today an app_unlock entitlement is recorded like any other and the platform does not yet refuse entry on it. Declaring it is NOT free, however, and it is not merely a label: set it only when you intend to charge for access. THREE EXTRA RULES APPLY TO \"app_unlock\" AND ARE ENFORCED BY THE PLATFORM VALIDATOR, NOT BY THIS SCHEMA (which declares that validator authoritative): priceBuzz may be at most 5000 Buzz, not the 50000 the priceBuzz bound below allows — an unlock is bought before the viewer has used the app, so it is capped at the same ceiling as a single Buzz tip and at the smallest Buzz top-up ($5); at most ONE app_unlock good may be declared per manifest, so \"is this viewer admitted?\" has exactly one answer; and the good MUST carry a `justification`, because adding one turns a free app into a paid app and a moderator has to be told why.",
+            "enum": ["good", "app_unlock"]
+          },
+          "justification": {
+            "type": "string",
+            "description": "Why this good exists, shown to the moderator at review and never to the viewer. REQUIRED when kind is \"app_unlock\", because adding an unlock means your app starts charging for access and a moderator has to be told why. Note that declaring any `goods` catalog ALSO requires the `goods:purchase:self` scope — including a catalog whose only entry is an app_unlock — so do not read this field as a substitute for that scope. It exists because the scope is declared once and does not change when a later version adds an unlock: an app that already sells ordinary items can start charging for admission without its permission set moving at all, and this is what makes that visible at review. Optional for an ordinary good. Review metadata only: unlike `payload` it is never copied onto an entitlement, and the platform records your claim without verifying it. The server measures the TRIMMED length, so this maxLength is never more permissive than the server.",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "payload": {
+            "type": "object",
+            "description": "Optional OPAQUE payload copied verbatim onto the entitlement at purchase and handed back to your app unchanged. The platform never reads or interprets it. It is manifest-sourced rather than client-supplied precisely so that what an entitlement carries is something a moderator saw. Must serialize to at most 2048 bytes."
+          }
+        }
+      }
+    },
+    "analytics": {
+      "type": "object",
+      "description": "Optional CUSTOM EVENTS declaration. `events` names every event your app may send with `useBlockAnalytics().track(name, properties)` and the properties each event may carry. Manifest-governed and REVIEW-GATED: the declaration a moderator approves is the only one the platform will accept events against, so a reviewer can see what your app tracks. Properties are typed `enum` (a declared list of string values), `number` or `boolean` ONLY — free-text strings are deliberately not supported, so a string that is not one of an enum's declared values will never be recorded. That is what keeps prompts, emails and usernames out of string properties (a `number` property is not range-limited, so do not use one to carry an identifier). Owners will see aggregates only, never individual events. The platform's manifest validator is authoritative.",
+      "additionalProperties": false,
+      "properties": {
+        "events": {
+          "type": "object",
+          "description": "Map of event name → declaration. At most 50 events. An event name is lowercase snake_case: a letter, then up to 63 of a-z, 0-9 or _.",
+          "maxProperties": 50,
+          "additionalProperties": false,
+          "patternProperties": {
+            "^[a-z][a-z0-9_]{0,63}$": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "description": {
+                  "type": "string",
+                  "description": "Optional human-readable meaning of the event, shown to reviewers and in your analytics.",
+                  "maxLength": 200
+                },
+                "properties": {
+                  "type": "object",
+                  "description": "Map of property name → declaration. At most 10 properties per event. A property name follows the same rule as an event name.",
+                  "maxProperties": 10,
+                  "additionalProperties": false,
+                  "patternProperties": {
+                    "^[a-z][a-z0-9_]{0,63}$": {
+                      "type": "object",
+                      "allOf": [
+                        {
+                          "$comment": "Checked FIRST, before the oneOf below, so a wrong type is reported as such rather than as a missing `values`.",
+                          "required": ["type"],
+                          "properties": {
+                            "type": {
+                              "description": "The property's type. There is no free-text string type: declare an enum.",
+                              "enum": ["enum", "number", "boolean"]
+                            }
+                          }
+                        },
+                        {
+                          "oneOf": [
+                            {
+                              "type": "object",
+                              "description": "A string drawn from a declared list. A string outside `values` will not be recorded.",
+                              "additionalProperties": false,
+                              "required": ["type", "values"],
+                              "properties": {
+                                "type": {
+                                  "const": "enum"
+                                },
+                                "values": {
+                                  "type": "array",
+                                  "description": "The allowed values: 1 to 50 distinct non-empty strings of at most 64 characters (Unicode code points) each.",
+                                  "minItems": 1,
+                                  "maxItems": 50,
+                                  "uniqueItems": true,
+                                  "items": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 64
+                                  }
+                                }
+                              }
+                            },
+                            {
+                              "type": "object",
+                              "description": "A number.",
+                              "additionalProperties": false,
+                              "required": ["type"],
+                              "properties": {
+                                "type": {
+                                  "const": "number"
+                                }
+                              }
+                            },
+                            {
+                              "type": "object",
+                              "description": "A boolean.",
+                              "additionalProperties": false,
+                              "required": ["type"],
+                              "properties": {
+                                "type": {
+                                  "const": "boolean"
+                                }
+                              }
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "targets": {
+      "type": "array",
+      "description": "Model-page slot targets. Each target's slotId must be a known registered model slot (not the page slot). Optional for page-only apps.",
+      "maxItems": 16,
+      "items": {
+        "type": "object",
+        "required": ["slotId"],
+        "properties": {
+          "slotId": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "$comment": "outputDir is required whenever buildCommand is set. NOTE: the server-owned iframe.src and trustTier fields are rejected by the platform validator (and the CLI in Go) with clearer error messages than JSON Schema's `not`; they are declared in `properties` above only so the schema documents them.",
+      "if": {
+        "required": ["buildCommand"]
+      },
+      "then": {
+        "required": ["outputDir"]
+      }
+    }
+  ]
+}
