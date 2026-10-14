@@ -1,0 +1,2820 @@
+/**
+ * Public type surface for the `@civitai/app-sdk/blocks` subpath.
+ *
+ * Framework-agnostic. Hooks and transport classes that consume these types
+ * live in a separate package so this module stays usable from any runtime.
+ */
+
+import type { BlockCategory } from './scopes.js';
+
+// ============================================================
+// Runtime context delivered to a block at init
+// ============================================================
+
+/**
+ * The slot ids the host renders a block into TODAY, as a closed union.
+ *
+ * Mirrors `SLOT_REGISTRY` in civitai/civitai's
+ * `src/shared/constants/slot-registry.ts`. Keep in lockstep — the registry is
+ * the authority, this is the mirror.
+ *
+ * `model.actions_extra` is registered and live but has no production producer
+ * yet; it is listed because the registry lists it, not because a page emits it.
+ */
+export type ModelSlotId =
+  | 'model.sidebar_top'
+  | 'model.below_images'
+  | 'model.actions_extra';
+
+/** The single PAGE slot (`<slug>.civit.ai` / `/apps/run/<slug>`). */
+export type PageSlotId = 'app.page';
+
+/** Every slot id this SDK version knows a context shape for. */
+export type KnownSlotId = ModelSlotId | PageSlotId;
+
+/**
+ * Per-instance context the host page passes to the block at mount time — a
+ * DISCRIMINATED UNION keyed on `slotId`.
+ *
+ * v1 shipped this as `{ slotId: string; [key: string]: unknown }`. An untyped
+ * index signature in a public third-party contract can't be relied on (it types
+ * every misspelling as a legal `unknown` read) and it leaks by accident (any
+ * field a producer happens to set is typed as readable, whether or not the host
+ * actually forwards it). It is replaced by named per-slot members:
+ *
+ *  - {@link ModelSlotContext} — the three `model.*` slots.
+ *  - {@link PageSlotContext}  — the `app.page` slot.
+ *  - {@link UnknownSlotContext} — the FORWARD-COMPAT arm: a slot this SDK
+ *    version has no shape for. It carries `slotId` and NOTHING else, so a host
+ *    that adds a slot cannot break a block's typecheck, and reading a field off
+ *    it requires an explicit, visible cast rather than an accidental
+ *    index-signature read.
+ *
+ * NARROW WITH THE GUARDS, not with a bare `===`. {@link isModelSlotContext} /
+ * {@link isPageSlotContext} narrow exactly (and are real RUNTIME checks — the
+ * value crossed a `postMessage` boundary, so its static type is a claim, not a
+ * fact). A bare `ctx.slotId === 'model.sidebar_top'` cannot exclude
+ * {@link UnknownSlotContext}, whose `slotId` is a plain `string`, so it narrows
+ * to `ModelSlotContext | UnknownSlotContext` and the model fields stay
+ * unreadable. That is the cost of staying open to new slots; the guards pay it.
+ *
+ * Mirrors `BlockSlotContext` in civitai/civitai's
+ * `src/components/AppBlocks/types.ts`.
+ *
+ * @example
+ * const { context } = useBlockContext();
+ * if (isModelSlotContext(context)) {
+ *   // context.modelId is `number` here
+ *   submit({ kind: 'textToImage', modelId: context.modelId, ... });
+ * }
+ */
+export type BlockContext = ModelSlotContext | PageSlotContext | UnknownSlotContext;
+
+/**
+ * A slot this SDK version has no named shape for — the forward-compat arm of
+ * {@link BlockContext}.
+ *
+ * DELIBERATELY has no index signature. A host that adds a slot id keeps
+ * typechecking (the arm absorbs it), but nothing becomes silently readable: to
+ * read a field the author must cast, which is a visible, reviewable act rather
+ * than the accidental `ctx.whatever` an index signature permits.
+ */
+export interface UnknownSlotContext {
+  slotId: string;
+}
+
+/**
+ * Snapshot of the effective Checkpoint the block will generate against —
+ * already merged from publisher default + viewer override on the host.
+ * For Checkpoint-bound installs this is the model itself; for LoRA installs
+ * it's whichever Checkpoint the resolver picked.
+ *
+ * `null` (via `ModelSlotContext.checkpoint`) means no checkpoint is
+ * configured; blocks should render a "missing checkpoint" CTA pointing the
+ * user at the model owner.
+ *
+ * Mirrors `BlockCheckpointInfo` in civitai/civitai's
+ * `src/components/AppBlocks/types.ts`.
+ */
+export interface BlockCheckpointInfo {
+  versionId: number;
+  modelId: number;
+  modelName: string;
+  versionName: string;
+  baseModel: string;
+}
+
+/**
+ * The resource types the PAGE resource picker (`useResourcePicker`) accepts in
+ * v1: Checkpoint + LoRA only. Matches the page-LoRA body contract — a
+ * Checkpoint pick goes into `body.modelVersionId`, a LoRA pick into
+ * `body.additionalResources`. The host REJECTS any other requested type (the
+ * native modal never opens). Widen here + on the host when the body schema
+ * grows.
+ */
+export type BlockResourcePickerType = 'Checkpoint' | 'LORA';
+
+/**
+ * What the host returns from the PAGE resource picker
+ * (`RESOURCE_PICKER_RESULT.selected`). DELIBERATELY narrow: only the fields a
+ * block needs to build a generation body + dedupe/display — never the catalog,
+ * a list, or any private / availability / early-access / NSFW internal. The
+ * picker is DISCOVERY ONLY: `versionId` is re-validated server-side at
+ * estimate/submit by the page gate + orchestrator belt, so nothing here is an
+ * entitlement.
+ *
+ * Mirrors the host's `RESOURCE_PICKER_RESULT` projection in civitai/civitai's
+ * `PageBlockHost.tsx`. Keep in lockstep.
+ */
+export interface BlockResourceInfo {
+  /** ModelVersion id — the wire identifier `body.modelVersionId` /
+   * `additionalResources[].modelVersionId` needs. */
+  versionId: number;
+  modelId: number;
+  /** Public display name of the picked model — the user chose this resource,
+   * so the host surfaces its name for the block to render (instead of `#id`).
+   * Same source as `BlockCheckpointInfo.modelName`. */
+  modelName: string;
+  /** Public display name of the picked model version. Same source as
+   * `BlockCheckpointInfo.versionName`. */
+  versionName: string;
+  /** The resource's base model (e.g. 'Flux.1 D', 'SDXL 1.0') so the block can
+   * keep a LoRA pick in the checkpoint's family client-side. */
+  baseModel: string;
+  /** 'Checkpoint' | 'LORA' (the canonical model type the host resolved). */
+  modelType: string;
+  // --- Public recommended-settings projection (App Blocks Phase-2a PR-C) ---
+  // The host WIDENED the `RESOURCE_PICKER_RESULT.selected` projection (and the
+  // sibling `GET /api/v1/blocks/generation-resources` rehydrate endpoint) to also
+  // carry the PUBLIC recommended settings a block needs to render a per-resource
+  // weight slider + trigger words — nothing availability/entitlement-related. All
+  // OPTIONAL + additive: a host predating PR-C omits them, and the values are
+  // still DISCOVERY-ONLY hints (the server re-derives + re-prices at submit).
+  // Mirrors civitai's `SafeGenerationResource` / `projectSafeGenerationResource`.
+  /** Recommended default resource weight (the host defaults this to `1`). */
+  strength?: number;
+  /** Recommended min weight clamp (host default `-1`). */
+  minStrength?: number;
+  /** Recommended max weight clamp (host default `2`). */
+  maxStrength?: number;
+  /** Public trigger words (host default `[]`). */
+  trainedWords?: string[];
+  /** Public recommended CLIP-skip; `null` when the resource has none. */
+  clipSkip?: number | null;
+}
+
+/**
+ * A Civitai-hosted source image for an img2img generation. Mirrors civitai's
+ * `blockSourceImageSchema` (`{ url, width, height }` — all three REQUIRED), the
+ * element type of BOTH `blockTextToImageBodySchema.sourceImages` (current) and
+ * its deprecated singular alias `.sourceImage`.
+ *
+ * `url` MUST resolve to a Civitai-controlled host — the server rejects an
+ * arbitrary remote URL (SSRF / arbitrary-fetch). An image obtained from
+ * {@link BlockUploadedImageInfo.url} (via `useImageUpload`) satisfies this.
+ * `width`/`height` are the intrinsic dimensions the graph uses for its
+ * denoise/aspect derivation; the server bounds each to 64–2048.
+ *
+ * In the array form EVERY element is validated individually against exactly
+ * these rules — there is no "first element only" shortcut server-side.
+ */
+export interface BlockSourceImage {
+  url: string;
+  width: number;
+  height: number;
+}
+
+/**
+ * The moderated image the host returns from `OPEN_IMAGE_UPLOAD`
+ * (`IMAGE_UPLOAD_RESULT.selected`) — see {@link BlockUploadedImageInfo} usage in
+ * `useImageUpload`. The platform's only guarantee is that the image is scanned
+ * clean, within the SFW ceiling, and unflagged before its id crosses back into
+ * the (untrusted) block.
+ *
+ * Mirrors the host's `BlockUploadedImageInfo` projection in civitai/civitai's
+ * `src/components/AppBlocks/BlockImageUploadModal.tsx`. Keep in lockstep.
+ * NOTE: `imageId` is a NUMBER (the `Image` row id), matching the host — not a
+ * string. `contentRating` is the off-site rating ladder value (identical to
+ * {@link ContentRating}).
+ */
+export interface BlockUploadedImageInfo {
+  /** The moderated `Image` row id. */
+  imageId: number;
+  /** The scanner's resolved NSFW-level bitmask value. */
+  nsfwLevel: number;
+  /** Off-site content rating (`'g' | 'pg' | 'pg13' | 'r' | 'x'`). */
+  contentRating: ContentRating;
+  /** The Civitai-hosted image URL — usable directly as a {@link BlockSourceImage.url}. */
+  url: string;
+}
+
+/**
+ * Early-resolve handle for an ASYNC-SCAN `'display'` upload (`asyncScan: true`
+ * on `OPEN_IMAGE_UPLOAD`). The image has been PERSISTED (its `imageId` is known)
+ * but is NOT yet scanned — so it is AUTHOR-PREVIEW-ONLY until the verdict lands.
+ * The host early-resolves the upload modal with this handle and streams the scan
+ * verdict later via {@link BlockImageScanResult} on a host→block `IMAGE_SCAN_RESOLVED`.
+ *
+ * `status: 'pending'` is the on-wire DISCRIMINANT that tells the SDK hook this is
+ * a pending handle rather than a moderated {@link BlockUploadedImageInfo} (a host
+ * that predates async-scan returns the moderated shape directly — the hook treats
+ * that as immediately-scanned; see the compat matrix in `useImageUpload`).
+ *
+ * SECURITY: a pending handle is NOT a moderation stamp. Its `imageId`/`url` are
+ * the author's OWN just-uploaded image and are safe to preview to that author,
+ * but MUST NOT be persisted to any cross-user surface until a `'scanned'` verdict
+ * arrives — the server-side display gate remains authoritative and refuses to
+ * serve an unscanned/blocked image to others.
+ *
+ * Mirrors the host's pending projection in civitai/civitai's
+ * `BlockImageUploadModal.tsx` / `PageBlockHost.tsx`. Keep in lockstep.
+ */
+export interface BlockPendingImageInfo {
+  /** On-wire discriminant vs the moderated {@link BlockUploadedImageInfo}. */
+  status: 'pending';
+  /** The persisted `Image` row id (NOT yet scan-cleared). */
+  imageId: number;
+  /**
+   * Civitai-hosted edge URL of the author's OWN just-uploaded image (an
+   * unguessable UUID key). AUTHOR-ONLY preview; NOT persisted to any cross-user
+   * surface until the scan verdict is `'scanned'`.
+   */
+  url: string;
+}
+
+/**
+ * Async scan verdict for a pending `'display'` upload, delivered host→block on
+ * `IMAGE_SCAN_RESOLVED` (correlated to the originating `OPEN_IMAGE_UPLOAD` by its
+ * `requestId` + the `imageId`). A discriminated union:
+ *
+ *  - `'scanned'` — the image cleared the pipeline: scanned clean, within the SFW
+ *    ceiling, and unflagged. ONLY this verdict carries a usable moderated
+ *    {@link BlockUploadedImageInfo} projection (the same shape the BLOCKING path
+ *    returns). This is the only verdict on which a block may persist the image to
+ *    a cross-user surface.
+ *  - `'blocked'` — a TERMINAL non-clean outcome (scan verdict / over the NSFW
+ *    ceiling / flagged / import-failed). Carries NO usable image — the block must
+ *    NOT persist it. `reason` is an optional UI-renderable message.
+ *  - `'error'` — a TRANSIENT / host-side error or poll-budget timeout. RETRYABLE
+ *    (a network blip must NOT be mislabelled `'blocked'`); the block may re-call
+ *    `scanStatus`. Carries NO usable image. `message` is an optional detail.
+ *
+ * Mirrors the host's `BlockImageScanPoller` verdict in civitai/civitai's
+ * `PageBlockHost.tsx`. Keep in lockstep.
+ */
+export type BlockImageScanResult =
+  | { status: 'scanned'; image: BlockUploadedImageInfo }
+  | { status: 'blocked'; reason?: string }
+  | { status: 'error'; message?: string };
+
+/**
+ * Upload MODE for `OPEN_IMAGE_UPLOAD` (via {@link useImageUpload}). Mirrors the
+ * host's `BlockUploadPurpose` in civitai/civitai's `pageBlockHostLogic.ts`.
+ *
+ *  - `'display'` (DEFAULT — absent/unrecognized normalizes to this on the host,
+ *    so an SDK that omits `purpose` stays byte-compatible): a PUBLIC image that
+ *    routes through the session-authed scan pipeline (SFW + no-flag gate). The
+ *    host returns a moderated {@link BlockUploadedImageInfo}.
+ *  - `'generationSource'`: a PRIVATE generation INPUT (an img2img source image).
+ *    UNSCANNED — the orchestrator scans it at generation time — so the host
+ *    returns ONLY the source shape ({@link BlockGenerationSourceImageInfo}); no
+ *    `imageId`/`nsfwLevel`/`contentRating` crosses back into the block.
+ */
+export type BlockUploadPurpose = 'display' | 'generationSource';
+
+/**
+ * Which SPACE a `NAVIGATE` path is resolved in. Mirrors the host's
+ * `NavigateScope` in civitai/civitai's `pageBlockHostLogic.ts`. Keep in lockstep.
+ *
+ *  - `'app'` (DEFAULT): the path is resolved under the block's OWN route
+ *    (`<base>/<slug>/<path>`) and pushed shallowly, so the page stays mounted.
+ *  - `'site'`: the path is resolved at the SITE root, non-shallow, and the viewer
+ *    leaves the app. Granted per-surface — the host refuses it outright on a
+ *    surface that does not hold the capability — and `/api/*` is refused in this
+ *    scope regardless.
+ *
+ * 🔴 ABSENT IS `'app'`, and the host compares against the literal `'site'` rather
+ * than validating against this union, so an UNKNOWN value fails CLOSED onto
+ * `'app'` too. That is what makes the field additive: a block built against an
+ * SDK that predates `scope` sends nothing and keeps the behaviour it always had.
+ *
+ * 🔴 A LEADING SLASH CARRIES NO MEANING. `scope` selects the space and `path` is a
+ * path WITHIN it, so the host normalises leading slashes away:
+ * `{ scope: 'app', path: '/settings' }` and `{ scope: 'app', path: 'settings' }`
+ * are one request. Do not reintroduce punctuation semantics.
+ */
+export type BlockNavigateScope = 'app' | 'site';
+
+/**
+ * The source-image result the host returns from `OPEN_IMAGE_UPLOAD` when the
+ * block requested `purpose: 'generationSource'` (`IMAGE_UPLOAD_RESULT.selected`)
+ * — an UNSCANNED private img2img input. Identical to {@link BlockSourceImage}
+ * (the element type of {@link WorkflowBodyTextToImage.sourceImages}): only
+ * `{ url, width, height }`, with no `imageId`/`nsfwLevel`/`contentRating` (the
+ * image is scanned later, at generation time, not before its handle crosses into
+ * the block). The `url` is a Civitai-hosted host, so it feeds straight into a
+ * `WorkflowBody.sourceImages` entry (or the deprecated singular
+ * `WorkflowBody.sourceImage`).
+ *
+ * Mirrors the host's `BlockSourceImageInfo` in civitai/civitai's
+ * `src/components/AppBlocks/BlockGenerationSourceUploadModal.tsx`. Keep in
+ * lockstep.
+ */
+export type BlockGenerationSourceImageInfo = BlockSourceImage;
+
+/**
+ * One of the model version's curated preview images, with the standard
+ * gen params extracted from its source meta. Block UIs use these to let
+ * the user "remix" a known-good prompt without typing it.
+ *
+ * `null` on a gen-param field means the source image's meta didn't have
+ * that value (or it was malformed). The block should treat null as "keep
+ * the current value" rather than clearing the field — that way a partial
+ * meta doesn't trash a prompt the user already typed.
+ *
+ * Mirrors `ShowcaseImage` in civitai/civitai's
+ * `src/components/AppBlocks/types.ts`. Keep in lockstep.
+ */
+export interface ShowcaseImage {
+  id: number;
+  url: string;
+  width: number;
+  height: number;
+  prompt: string | null;
+  negativePrompt: string | null;
+  cfgScale: number | null;
+  steps: number | null;
+  seed: number | null;
+  sampler: string | null;
+  /** Per-resource CLIP layer skip count (SD1/SDXL). Flux ignores it. */
+  clipSkip: number | null;
+}
+
+/**
+ * The shape the host delivers for the three model-page slots
+ * (`model.sidebar_top`, `model.below_images`, `model.actions_extra`).
+ *
+ * Every field here is one the host's `projectBlockInitContext` ALLOWLIST
+ * actually forwards — see the note below; the v1 shape of this interface named
+ * five more that no longer arrive. (They DID arrive once: before the
+ * data-minimisation projection landed, `IframeHost` spread the entire producer
+ * context onto the wire, which is what the allowlist was written to stop. So the
+ * accurate claim is "not forwarded since the projection", not "never sent".)
+ *
+ * Narrow to it with {@link isModelSlotContext}:
+ *
+ *   const { context } = useBlockContext();
+ *   if (isModelSlotContext(context)) { context.modelId // number }
+ *
+ * Mirrors `ModelSlotContext` in civitai/civitai, INTERSECTED WITH that repo's
+ * `CONTEXT_ALLOWLIST` (`src/components/AppBlocks/projectBlockInit.ts`). Keep in
+ * lockstep — and note the two sides are not the same set: the host's interface
+ * describes what a PRODUCER passes to `<BlockSlot>`, this one describes what
+ * survives the projection and reaches the iframe.
+ */
+export interface ModelSlotContext {
+  slotId: ModelSlotId;
+  modelId: number;
+  modelVersionId: number;
+  modelName: string;
+  modelType: string;
+  modelNsfwLevel: number;
+  /** Host-page color scheme; lets the iframe match without a flicker. */
+  theme?: Theme;
+  /**
+   * Effective Checkpoint after publisher-default ∪ viewer-override merge.
+   * `null` when no checkpoint is configured (publisher hasn't set one AND
+   * the bound model isn't a Checkpoint itself) — block should render a
+   * "missing checkpoint" state and prompt the user to ask the model owner.
+   *
+   * The host sets this EXPLICITLY on every model-slot init (never spread from
+   * the producer), so on a model slot it is always present — `null` or a value.
+   */
+  checkpoint?: BlockCheckpointInfo | null;
+  /**
+   * Top showcase images for the bound model version, ordered by all-time
+   * reactions. Capped at 6 by the host. Empty array means the version
+   * has no preview images yet. The block uses these to render a "click
+   * to remix" carousel that populates the form from the selected image's
+   * gen meta.
+   */
+  showcaseImages?: ShowcaseImage[];
+}
+
+/**
+ * The shape the host delivers for the PAGE slot (`app.page`) — a per-app page
+ * at `<slug>.civit.ai` / `/apps/run/<slug>`.
+ *
+ * 🔴 This member is NEW in the SDK, not new on the wire. `PageBlockHost` has
+ * been sending exactly this object since the page surface shipped; v1's
+ * `BlockContext` index signature simply meant page blocks read it untyped. So
+ * adding it changes no runtime behaviour on either side — it only stops page
+ * authors from guessing.
+ *
+ * Unlike the model slots, this context is NOT run through
+ * `projectBlockInitContext` — `PageBlockHost.buildContext()` builds it directly,
+ * which is why `viewerUserId` / `viewerUsername` DO arrive here even though the
+ * model-slot allowlist drops them.
+ *
+ * Mirrors `PageContext` in civitai/civitai's `src/components/AppBlocks/types.ts`.
+ */
+export interface PageSlotContext {
+  slotId: PageSlotId;
+  /** Always `'none'` — a page slot is not bound to an entity. */
+  entityType?: 'none';
+  /** The app's slug (the `<slug>` in `<slug>.civit.ai`). */
+  slug: string;
+  /**
+   * The path segment BELOW the app root, from `router.query.path` — `''` on the
+   * app's own index. Lets a page app route internally without owning history.
+   */
+  subPath: string;
+  /** `null` for an anonymous viewer. */
+  viewerUserId: number | null;
+  /** Absent/`null` when the viewer has no handle. */
+  viewerUsername?: string | null;
+  /** Host-page color scheme; lets the iframe match without a flicker. */
+  theme?: Theme;
+}
+
+/**
+ * Narrow a {@link BlockContext} to {@link ModelSlotContext}.
+ *
+ * A real runtime check, not just a cast: the context arrived over
+ * `postMessage`, so its static type is the host's claim about it. Returning
+ * `true` here is what lets the block render a useful "wrong slot" state instead
+ * of `undefined`-ing its way through a generation body.
+ *
+ * 🔴 IT CHECKS EVERY FIELD IT ASSERTS, not just `slotId`. A `slotId`-only check
+ * is not enough, because {@link UnknownSlotContext} declares `slotId: string` —
+ * so a structurally-incomplete known slot (`{ slotId: 'model.sidebar_top' }` and
+ * nothing else) is a legal `BlockContext` that COMPILES, passes a `slotId`-only
+ * guard, and then hands the block `ctx.modelId` typed `number` and valued
+ * `undefined`. The five required fields are asserted individually so the
+ * predicate is true exactly when the type it claims is true.
+ *
+ * No legitimate host payload is rejected by the extra checks. The only
+ * production producer of a model slot (civitai/civitai
+ * `ModelVersionDetails.tsx`) sets all five unconditionally, and the host's own
+ * pinned allowlist test (`__tests__/projectBlockInit.test.ts`) asserts the
+ * projected context carries them as an EXACT key set. A payload that somehow
+ * lacked one is precisely the case the block must not treat as a model context.
+ */
+export function isModelSlotContext(ctx: BlockContext): ctx is ModelSlotContext {
+  if (
+    ctx.slotId !== 'model.sidebar_top' &&
+    ctx.slotId !== 'model.below_images' &&
+    ctx.slotId !== 'model.actions_extra'
+  ) {
+    return false;
+  }
+  const c = ctx as Partial<ModelSlotContext>;
+  return (
+    typeof c.modelId === 'number' &&
+    typeof c.modelVersionId === 'number' &&
+    typeof c.modelName === 'string' &&
+    typeof c.modelType === 'string' &&
+    typeof c.modelNsfwLevel === 'number'
+  );
+}
+
+/**
+ * Narrow a {@link BlockContext} to {@link PageSlotContext}. Same shape and same
+ * reasoning as {@link isModelSlotContext}: the three fields `PageSlotContext`
+ * declares REQUIRED are checked, not just `slotId`.
+ *
+ * `subPath` is checked as a string, not a NON-EMPTY one — `''` is the real value
+ * on an app's own index (`PageBlockHost.buildContext()`), and rejecting it would
+ * make every app's landing route fail to narrow. `viewerUserId` is `number |
+ * null`, and `null` is the genuine anonymous value.
+ */
+export function isPageSlotContext(ctx: BlockContext): ctx is PageSlotContext {
+  if (ctx.slotId !== 'app.page') return false;
+  const c = ctx as Partial<PageSlotContext>;
+  return (
+    typeof c.slug === 'string' &&
+    typeof c.subPath === 'string' &&
+    (typeof c.viewerUserId === 'number' || c.viewerUserId === null)
+  );
+}
+
+/**
+ * Short-lived, block-scoped JWT minted by civitai.com for a single block
+ * instance. Carries the scopes the user consented to plus an optional
+ * Buzz spend budget the parent enforces on orchestrator calls.
+ */
+export interface BlockToken {
+  raw: string;
+  scopes: string[];
+  expiresAt: Date;
+  buzzBudget?: number;
+}
+
+/**
+ * Settings the block sees: publisher-controlled (from manifest defaults +
+ * any per-deployment overrides) and user-controlled (per-instance prefs).
+ */
+export interface BlockSettings {
+  publisherSettings: Record<string, unknown>;
+  userSettings: Record<string, unknown>;
+}
+
+/**
+ * The signed-in viewer. `null` in `BlockInitPayload.viewer` means anonymous.
+ *
+ * 🔴 DATA-MINIMISATION IN PROGRESS — never read `id`/`username` to answer "is
+ * someone signed in?". Call {@link isSignedIn} instead; it is the one place the
+ * gate is spelled, and its doc states the rule in full.
+ *
+ * `BLOCK_INIT` discloses the viewer's identity to EVERY block unconditionally
+ * on load, before any interaction. Almost every block only needs to know
+ * *whether* someone is signed in (to choose between a real UI and a
+ * sign-in CTA) — and for that, a boolean is sufficient. A block that genuinely
+ * needs the identity should call {@link BlockViewer} via `GET_VIEWER` /
+ * `useViewer()`, which is scope-gated and auditable PER CALL rather than
+ * broadcast to everyone on mount.
+ *
+ * `id` and `username` are therefore `@deprecated` and will be removed in a
+ * later release — but they are still SENT, and this interface is still an
+ * OBJECT-OR-NULL on the wire. Both of those are load-bearing: the
+ * `isValidBlockInitPayload` guard compiled into every already-deployed block
+ * bundle rejects a `viewer` that is not `null` and not an object with a numeric
+ * `id`. A rejected `BLOCK_INIT` is re-sent — the host re-posts it every
+ * `INIT_RETRY_INTERVAL_MS` (400ms) until the block acks `BLOCK_READY`, ~25 times
+ * inside one `BLOCK_READY_TIMEOUT_MS` (10s) window — and each re-post carries
+ * the FRESHEST payload, not a byte-identical copy (both hosts re-point
+ * `buildInitPayloadRef` on every render). That freshness only ever varies
+ * query-resolved VALUES, never whether a required FIELD is present, so a guard
+ * rejecting for a missing field rejects every retry too. What happens at the end
+ * of the window is per-surface: `IframeHost` (model slot) has no auto-retry and
+ * renders `null`; `PageBlockHost` auto-retries the whole handshake twice more.
+ * See the `BlockInitPayload.blockId` doc in `messages.ts` for the per-surface
+ * detail, and the migration note in the changeset.
+ *
+ * `status` is OPTIONAL and a coarse surface — `/api/v1/blocks/me` is the
+ * authoritative re-check if the block needs to gate on it. The platform omits
+ * it from BLOCK_INIT to third-party iframes for privacy (civitai #2521), so
+ * blocks must not assume it is present.
+ *
+ * Mirrors the inline viewer shape in `BlockInitPayload` on the platform
+ * side (civitai/civitai `src/components/AppBlocks/types.ts`).
+ */
+export interface ViewerInfo {
+  /**
+   * Whether a viewer is signed in. The MINIMAL signal, and the one this
+   * contract is migrating TO: it is what replaces `id`/`username` once those
+   * are removed. It exists as a field rather than as "non-null means signed in"
+   * so that a block reading it keeps compiling, and keeps meaning the same
+   * thing, after `id`/`username` go away.
+   *
+   * 🔴 DO NOT WRITE A GATE ON THIS FIELD — call {@link isSignedIn}. This field
+   * is OPTIONAL and unvalidated at the trust boundary; `isSignedIn` answers the
+   * same question from the property the boundary does enforce, and its doc
+   * carries the three measured reasons.
+   *
+   * The settled facts about the field itself, and where each is checkable:
+   *
+   *  - The host stamps it. civitai/civitai `src/components/AppBlocks/
+   *    projectBlockInit.ts` exports `withSignedInFlag()`, which returns `null`
+   *    for an anonymous viewer and `{ id, username, signedIn: true }` otherwise.
+   *    BOTH host surfaces funnel through it — `IframeHost` (the model slot,
+   *    which derives its viewer from the slot context) and `PageBlockHost` (the
+   *    full-page surface, which receives an already-resolved `viewer` prop) —
+   *    so there is no half-covered fleet.
+   *  - That repo's own contract test (`__tests__/projectBlockInit.test.ts`) now
+   *    pins the BLOCK_INIT viewer key set as exactly
+   *    `['id', 'signedIn', 'username']`, and asserts the value is literally
+   *    `true` rather than a computed boolean.
+   *  - It arrived with civitai/civitai#3707 (merged 2026-08-07). Earlier
+   *    revisions of this doc first told authors to write `viewer !== null`
+   *    (correct at the time — the field was not yet on the wire) and then told
+   *    them to write `viewer?.signedIn === true`. Both spellings are now
+   *    confined to {@link isSignedIn}, which is the answer to "which one?".
+   *
+   * OPTIONAL, and it must stay optional: `BlockInitPayload` is also the shape
+   * older host code paths and test fixtures construct, so a REQUIRED field here
+   * would break them at compile time for no wire benefit. That optionality is
+   * also the first reason {@link isSignedIn} does not read it — an omitting host
+   * makes `viewer?.signedIn === true` read `false` for a signed-in viewer.
+   *
+   * A malformed value is not rejected at the trust boundary — see the note on
+   * `isValidBlockInitPayload` in `@civitai/blocks-react`: failing the whole init
+   * over one advisory flag would cost the block every other field. So this is
+   * the one viewer property nothing validates, which is the second reason
+   * {@link isSignedIn} gates on presence instead. If a block reads the field
+   * directly anyway, compare it to `true` rather than treating it as a boolean.
+   */
+  signedIn?: true;
+  /**
+   * @deprecated Init-time identity disclosure. Use `useViewer()` (`GET_VIEWER`)
+   * for the viewer id — it is scope-gated and audited per call. Still sent;
+   * scheduled for removal once block adoption of `useViewer()` is measured.
+   */
+  id: number;
+  /**
+   * @deprecated Init-time identity disclosure. Use `useViewer()` (`GET_VIEWER`)
+   * for the username. Still sent; scheduled for removal alongside `id`.
+   */
+  username: string | null;
+  /** @deprecated Not sent by the platform to third-party iframes (civitai #2521). */
+  status?: 'active' | 'banned' | 'muted';
+}
+
+/**
+ * THE sign-in gate. Pass `useBlockContext().viewer` (or a `BlockInitPayload`'s
+ * `viewer`) and render the signed-in branch when it returns `true`.
+ *
+ * ```ts
+ * import { isSignedIn } from '@civitai/app-sdk/blocks';
+ * // …
+ * return <p>{isSignedIn(viewer) ? 'signed in' : 'anonymous'}</p>;
+ * ```
+ *
+ * It exists so that "is someone signed in?" is spelled ONCE, here, instead of
+ * being open-coded in every block, every doc snippet and every `tiged`-copied
+ * starter. If the wire contract ever changes, this body is the only thing that
+ * has to change with it.
+ *
+ * 🔴 IT DOES NOT READ {@link ViewerInfo.signedIn}, AND THAT IS THE POINT.
+ * `viewer?.signedIn === true` looks like the more precise gate; it is the more
+ * FRAGILE one, for three reasons that are checkable rather than stylistic:
+ *
+ *  1. `signedIn` is OPTIONAL (`signedIn?: true`) and must stay optional — a
+ *     host that predates it omits the field entirely. `viewer?.signedIn === true`
+ *     then reads `false` for a viewer who is genuinely signed in. Presence does
+ *     not have that failure mode: `viewer: null` is the ONLY anonymous value on
+ *     the wire, from every host version.
+ *  2. PRESENCE IS WHAT THE TRUST BOUNDARY ACTUALLY ENFORCES. `@civitai/blocks-
+ *     react`'s `isValidBlockInitPayload` pins `viewer` as object-or-null (that
+ *     shape is a compatibility floor compiled into every already-deployed block
+ *     bundle) and — in the same guard, deliberately — does NOT reject a
+ *     malformed `signedIn`, because failing the whole init over one advisory
+ *     flag would cost the block its token, context and settings too. So a gate
+ *     on `signedIn` is a gate on the one viewer property nothing validates,
+ *     while a gate on presence is a gate on the one property everything does.
+ *  3. THE NAMED FUTURE HAZARD LANDS ON `signedIn`, NOT ON PRESENCE. That same
+ *     guard's comment names the case it refuses to brick for: a host writing
+ *     `signedIn: !!user`. Under it, `viewer?.signedIn === true` shows a sign-in
+ *     CTA to someone already signed in; presence still answers correctly.
+ *
+ * The stated reason to prefer `signedIn` — that it outlives the `@deprecated`
+ * `id`/`username` — is delivered here in full: this predicate reads NEITHER
+ * field, so nothing a block writes through it has to change when they are
+ * removed. That was always the real requirement; reading `signedIn` was one way
+ * to meet it, and the weaker one.
+ *
+ * `signedIn` remains on `ViewerInfo` and is still sent — it is the explicit,
+ * self-describing wire signal, and it is what this function would switch to if
+ * presence ever stopped meaning sign-in. Today it is redundant with presence by
+ * construction: the host's `withSignedInFlag()` returns `null` for an anonymous
+ * viewer and stamps the literal `true` on every present one, so there is no
+ * value of the pair that the two spellings disagree about.
+ *
+ * Accepts `undefined` as well as `null` so it is safe on a pre-`BLOCK_INIT`
+ * snapshot and on a hand-built payload whose `viewer` key is simply absent.
+ */
+export function isSignedIn(viewer: ViewerInfo | null | undefined): boolean {
+  return viewer !== null && viewer !== undefined;
+}
+
+/**
+ * Host-page color scheme. v2 will add a sibling `themeCssVars` field on
+ * `BlockInitPayload` for design-token sharing; v1 ships the string only.
+ */
+export type Theme = 'light' | 'dark';
+
+// ============================================================
+// Workflow surface
+// ============================================================
+
+export type WorkflowStatus =
+  | 'idle'
+  | 'estimating'
+  | 'confirming'
+  | 'submitting'
+  | 'polling'
+  | 'done'
+  | 'error';
+
+/**
+ * The Buzz currency pools a Civitai App may spend from / read a balance for.
+ *
+ * DELIBERATELY narrow — the domain-clamped set the Civitai Apps host honors:
+ * `blue` (free/earned), `green` (creator-compensation pool), and `yellow`
+ * (purchased). It intentionally omits the platform-internal pools (`red`,
+ * `purple`, …) that appear in the broader `@civitai/app-sdk/oauth`
+ * `BuzzAccountType` — a block can neither prefer nor read those. Keep this in
+ * lockstep with civitai/civitai's block submit-body schema clamp.
+ */
+export type BuzzAccountType = 'blue' | 'green' | 'yellow';
+
+/**
+ * Generation parameters a block can override. All optional — the host fills
+ * sensible defaults (sampler='Euler', steps=25, dimensions from the
+ * base-model family) when omitted, so the simplest block can submit
+ * `{ kind: 'textToImage', modelId, modelVersionId, params: { prompt } }`.
+ *
+ * Bounds mirror civitai/civitai's `blockWorkflowBodySchema` zod gate; over-
+ * limit values are rejected server-side before reaching the orchestrator.
+ */
+export interface BlockTextToImageParams {
+  prompt: string;
+  negativePrompt?: string;
+  /** Range 1–30. */
+  cfgScale?: number;
+  /** Sampler name (e.g. 'Euler', 'DPM++ 2M Karras'). Defaults to 'Euler'. */
+  sampler?: string;
+  /** Range 1–50. */
+  steps?: number;
+  /** `null` lets the orchestrator pick. */
+  seed?: number | null;
+  /** Range 64–2048. Defaults to 1024 for SDXL/Flux, 512 for SD1/SD2. */
+  width?: number;
+  /** Range 64–2048. Same defaults as width. */
+  height?: number;
+  /** Per-resource CLIP layer skip count (SD1/SDXL). Range 0–12. Flux ignores it. */
+  clipSkip?: number;
+  /** Range 1–4. Defaults to 1. */
+  quantity?: number;
+}
+
+/**
+ * The text-to-image member of the {@link WorkflowBody} discriminated union
+ * (`kind: 'textToImage'`). This is the original, single-member shape — kept
+ * byte-identical for backward compatibility. An existing
+ * `{ kind: 'textToImage', modelId, modelVersionId, params }` body must
+ * continue to satisfy {@link WorkflowBody} unchanged.
+ *
+ * Both `modelId` and `modelVersionId` are required even though they're
+ * conceptually redundant — the host validates that `modelId` matches the
+ * JWT's `ctx.modelId` (context binding) AND that the version belongs to
+ * that model (DB lookup). The block always has both values from
+ * `useBlockContext().context as ModelSlotContext`.
+ */
+export type WorkflowBodyTextToImage = {
+  kind: 'textToImage';
+  modelId: number;
+  modelVersionId: number;
+  /**
+   * Optional additional generation resources (LoRAs) layered on top of the
+   * checkpoint (`modelVersionId`). Mirrors civitai's `blockWorkflowBodySchema`:
+   *  - max 5 entries
+   *  - each: { modelVersionId: positive int, strength?: number in [-1, 2], default 1 }
+   *  - the server is LoRA-only for additional resources (non-LoRA versions are
+   *    rejected) and enforces base-model-family compatibility with the checkpoint
+   *    + per-resource entitlement (early-access/Private) before any Buzz spend.
+   * Omit for a checkpoint-only generation (backward compatible).
+   */
+  additionalResources?: Array<{ modelVersionId: number; strength?: number }>;
+  /**
+   * Optional img2img init/source image (App Blocks IMAGE bridge). When present,
+   * the block bridge emits an img2img graph workflow instead of `txt2img`; omit
+   * for a plain text-to-image generation (backward compatible). Constraints
+   * (all SERVER-ENFORCED — mirrors civitai's `blockTextToImageBodySchema`):
+   *  - `url` must be a Civitai-hosted https image (an uploaded image from
+   *    {@link BlockUploadedImageInfo.url} qualifies) — never an arbitrary remote URL.
+   *  - The checkpoint's ecosystem must support an img2img variant — SD-family →
+   *    `img2img`, edit-capable (OpenAI / Qwen / Flux Kontext / …) →
+   *    `img2img:edit`. An ecosystem supporting NEITHER is rejected fail-closed.
+   *  - PAGE apps only — the server rejects source images on a model-bound token.
+   *
+   * @deprecated Send {@link WorkflowBodyTextToImage.sourceImages} instead — a
+   * 1-element `sourceImages` array produces a byte-identical generation (the
+   * server normalizes this singular field into a 1-element array and everything
+   * downstream sees only arrays). This alias keeps working INDEFINITELY — every
+   * deployed block and the published developer docs ship it — so nothing breaks
+   * by leaving it; it just cannot express more than one image. Sending BOTH
+   * fields is rejected as ambiguous.
+   */
+  sourceImage?: BlockSourceImage;
+  /**
+   * Optional img2img/edit source images — multi-image conditioning (App Blocks
+   * IMAGE bridge). The current field; supersedes the deprecated singular
+   * {@link WorkflowBodyTextToImage.sourceImage}. Omit BOTH for a plain
+   * text-to-image generation (backward compatible).
+   *
+   * Constraints (all SERVER-ENFORCED — mirrors civitai's
+   * `blockTextToImageBodySchema.sourceImages`, which is
+   * `z.array(blockSourceImageSchema).min(1).max(BLOCK_SOURCE_IMAGES_WIRE_MAX)`):
+   *  - **Every element is validated individually** — each `url` must be a
+   *    Civitai-hosted **https** image (an image from
+   *    {@link BlockUploadedImageInfo.url}, or a
+   *    {@link BlockGenerationSourceImageInfo} from a `'generationSource'`
+   *    upload, qualifies) and each `width`/`height` must be within 64–2048.
+   *    A bad element ANYWHERE rejects the whole body — there is no
+   *    "first element only" path.
+   *  - **The maximum count is PER-ECOSYSTEM, not a constant.** It is derived
+   *    from the checkpoint's own generation-graph `images` node, so it tracks
+   *    what the ecosystem actually supports: SD-family / Flux.1 Kontext / Boogu
+   *    / MAI **1**; Qwen / Qwen2 / MageFlow **3**; Reve / HiDream-O1 **4**;
+   *    WanImage **5**; Flux.2 / Flux.2 Klein / OpenAI / NanoBanana / Seedream /
+   *    Grok **7**. Exceeding the checkpoint's cap is REJECTED (never silently
+   *    truncated), and the error names both the count sent and the ecosystem's
+   *    limit. A flat wire bound of 10 additionally rejects an oversized array
+   *    before the body is parsed — it is NOT the product cap.
+   *  - **An empty array is REJECTED** (`.min(1)`); it is NOT treated as "no
+   *    source image". Omit the field entirely for text-to-image.
+   *  - **PAGE apps only** — the server rejects source images on a model-bound
+   *    token, for this array form as well as the singular one.
+   *  - Sending **both** `sourceImage` and `sourceImages` is REJECTED as
+   *    ambiguous rather than resolved to a winner. TypeScript cannot express
+   *    that mutual exclusion here (both are independently optional on this
+   *    member), so it surfaces as a server-side validation error — send exactly
+   *    one.
+   *  - Element ORDER is preserved into the graph's `images` input.
+   *
+   * 🔴 Requires a host running civitai/civitai#3518 or later. The text-to-image
+   * body schema is NOT `.strict()`, so a host predating #3518 does not error on
+   * this field — it SILENTLY STRIPS it and runs (and bills) a plain
+   * text-to-image generation with no image conditioning at all. There is no
+   * client-side way to detect that, so until #3518 is deployed everywhere you
+   * target, send the singular `sourceImage` (which works on both).
+   */
+  sourceImages?: BlockSourceImage[];
+  /**
+   * Optional shared-storage key of the published content this generation runs on
+   * behalf of. The server resolves it to the content's author for attribution
+   * (see the G5 civitai PR). Opaque string — the block passes back the `key` it
+   * got from `useSharedStorage()` for the content being generated against; omit
+   * when not applicable.
+   */
+  sharedContentKey?: string;
+  /**
+   * Optional preferred Buzz pool to fund this generation from — a *preference*,
+   * not a guarantee. The host clamps it server-side to what the viewer actually
+   * holds and to the domain-allowed pools (a `blockWorkflowBodySchema` field on
+   * civitai/civitai; preferred-first, then falls back). Omit for today's default
+   * host-chosen funding order (backward compatible). Whichever pool ended up the
+   * primary funder is echoed back on {@link BlockWorkflowSnapshot.spentAccountType}.
+   */
+  accountType?: BuzzAccountType;
+  params: BlockTextToImageParams;
+};
+
+/**
+ * The RECIPE arm of {@link WorkflowBodyCustomComfy} — runs a
+ * **server-registered, code-reviewed ComfyUI recipe** end-to-end. The block
+ * sends only a registered `recipe` id plus a small, per-recipe-validated
+ * `params` object; the civitai server owns the entire graph (built by object
+ * construction, so the prompt is a leaf value that cannot perturb graph
+ * topology).
+ *
+ * This is the DEFAULT arm. `mode` is optional here and a body that omits it
+ * lands on this arm, so every body written before the inline arm existed is
+ * unchanged and keeps working byte-for-byte.
+ *
+ * Trust / safety model (all SERVER-ENFORCED — mirrors civitai's
+ * `blockCustomComfyBodySchema`):
+ *  - `recipe` is a **registered recipe id** resolved against a code-reviewed,
+ *    in-repo recipe registry. An unknown id is **rejected server-side, fail-
+ *    closed** (the schema enum is derived from the registry keys).
+ *  - `params` are **bounded and validated per-recipe** by the server's
+ *    `.strict()` Zod param schema (extra fields rejected); each recipe pins
+ *    its own resources (checkpoint/LoRA/diffusion AIRs) — the block cannot
+ *    supply them.
+ *
+ * Billing is **post-paid** (the underlying orchestrator `customComfy` step
+ * bills measured GPU runtime at a fixed rate, so there is NO exact pre-price):
+ *  - `estimate` returns a per-recipe **display estimate**, not a firm quote —
+ *    surface it as an estimate; the actual cost is known only on terminal.
+ *  - Each recipe declares a hard per-job `maxBuzz` ceiling backed by an
+ *    aggressive step `timeout`; the orchestrator physically caps the job at
+ *    that ceiling server-side (worst-case Buzz = the timeout in seconds), and
+ *    the host gates `maxBuzz <= token.buzzBudget` before submit. A single job
+ *    therefore cannot exceed the recipe's declared ceiling no matter what.
+ */
+export type WorkflowBodyCustomComfyRecipe = {
+  kind: 'customComfy';
+  /**
+   * The arm discriminator, OPTIONAL on this arm. Omit it (the normal case) or
+   * set it to `'recipe'`; both land here. It exists so the inline arm can be
+   * selected explicitly with `mode: 'inline'`.
+   *
+   * 🔴 The host's schema declares this `z.literal('recipe').optional()` — NOT
+   * `.default('recipe')` — precisely so a body with no `mode` key still parses
+   * as a recipe. Do not "helpfully" send `mode: undefined` as a spread from an
+   * optional variable if you can avoid it; it parses fine today, but omitting
+   * the key entirely is the shape every deployed block sends.
+   */
+  mode?: 'recipe';
+  /**
+   * A **registered recipe id** (e.g. `'seamless-pano-360'`). Resolved server-
+   * side against the code-reviewed recipe registry; an unknown id is rejected
+   * fail-closed. The recipe fixes the graph, the resource allowlist, the
+   * checkpoint policy, and the `maxBuzz`/`timeout` budget ceiling — none of
+   * which the block can influence beyond selecting the recipe + `params`.
+   */
+  recipe: string;
+  /**
+   * Bounded, per-recipe-validated parameters. Only the fields a recipe's
+   * `.strict()` Zod schema accepts are honored; extra fields are rejected
+   * server-side. The common shape:
+   *  - `prompt` — the generation prompt (a leaf string; injected into the
+   *    server-built graph by object construction, never string-templated).
+   *  - `seed` — optional; `null`/omitted lets the orchestrator pick.
+   *  - `engine` — optional recipe engine-variant selector (e.g. a DiT engine);
+   *    the recipe defaults it when omitted.
+   *  - `accountType` — optional preferred Buzz pool (a preference, clamped
+   *    server-side to pools the viewer actually holds; see {@link BuzzAccountType}).
+   */
+  params: {
+    prompt: string;
+    seed?: number | null;
+    engine?: string;
+    accountType?: BuzzAccountType;
+  };
+};
+
+/**
+ * One node of a ComfyUI `/prompt` graph, as it travels on the wire.
+ *
+ * Mirrors the host's `inlineComfyNodeSchema`, which is `.strict()` with exactly
+ * these two fields — so a node carrying anything else (a `_meta` key from a
+ * ComfyUI export, for instance) is REJECTED at the wire, not dropped. Strip
+ * extras before submitting.
+ *
+ * `inputs` values are whatever ComfyUI accepts: literals, or a
+ * `[nodeId, outputIndex]` pair wiring this input to another node's output.
+ */
+export type InlineComfyNode = {
+  /** The ComfyUI node class, e.g. `'KSampler'`, `'CLIPTextEncode'`. */
+  class_type: string;
+  /** The node's inputs, keyed by input name. */
+  inputs: Record<string, unknown>;
+};
+
+/**
+ * The INLINE-GRAPH arm of {@link WorkflowBodyCustomComfy} (`kind:
+ * 'customComfy'`, `mode: 'inline'`) — the block ships **the ComfyUI graph
+ * itself**, so it can run a workflow the server's recipe registry does not
+ * contain.
+ *
+ * 🔴 THIS IS LIVE IN PRODUCTION. An earlier revision of this doc comment
+ * asserted that "there is no way for a block to run an arbitrary/unreviewed
+ * graph". That is FALSE and was removed: it predates the inline arm and cost a
+ * developer a dogfooding session, who trusted it over a working feature.
+ *
+ * 🔴 IT IS NOT "APP DEVELOPERS ONLY", AND THAT CLAIM USED TO BE HERE. This
+ * block read "**App developers only** — the host runs
+ * `assertViewerIsAppDeveloper` on every `customComfy` estimate AND submit. A
+ * non-developer viewer of your published block cannot submit one." Both
+ * sentences are FALSE: NEITHER `customComfy` arm runs any app-developer check,
+ * on the estimate or on the submit. The host's own schema module records the
+ * same retraction. Do not reintroduce it, in any wording — it is a SECURITY
+ * claim, and believing it is what makes an author ship an inline graph they
+ * would not ship to every viewer. An ordinary viewer of your published block
+ * CAN reach this arm once the refusals below pass.
+ *
+ * WHO CAN USE IT — stated as the refusals the host actually runs, before either
+ * arm's body is inspected. Each is a path your block has to handle:
+ *  - **Page tokens only** — a model-bound token is rejected.
+ *  - The token must carry the **`ai:write:budgeted`** consent scope.
+ *  - The viewer must be **signed in** — a token whose subject does not resolve
+ *    is refused.
+ *  - The viewer must be **enabled for Apps** (the runtime kill-switch, evaluated
+ *    on the token's subject; this is a closed beta).
+ *  - On **submit** only: the token must carry a **positive per-call Buzz
+ *    budget**. That budget is minted from YOUR OWN manifest
+ *    (`page.buzzBudgetPerGen`) — it is not a property of the viewer.
+ * A registered recipe is how you get a reviewed graph you do not have to ship in
+ * the body. It is not a way onto a surface the inline arm cannot reach.
+ *
+ * WHAT REPLACED CODE REVIEW. A recipe is reviewed in-repo, and that review was
+ * the trust root. An inline graph has none, so the host substitutes three
+ * mechanical, fail-closed gates that all run BEFORE any spend or orchestrator
+ * call (a rejection therefore costs nothing):
+ *  1. **AIR containment.** Every AIR URN appearing anywhere in the graph —
+ *     including as an object KEY — must also appear in {@link resources}. The
+ *     match is whole-string (trimmed, case-insensitive), so an AIR embedded in
+ *     a longer string does not count as declared and the body is rejected.
+ *  2. **Entitlement**, over the declared `resources`. Stricter than the onsite
+ *     generator: early-access `hasAccess` and Private/epoch subscription are
+ *     both folded in, an unresolvable version id is a hard `FORBIDDEN`, and a
+ *     resource the site would silently SUBSTITUTE with a sibling version is
+ *     REJECTED instead — your graph names one specific AIR and nothing rewrites
+ *     it.
+ *  3. **Moderation sweep.** The audit reads the declared `prompt` AND every
+ *     distinct string leaf in the graph, because a real graph carries its
+ *     prompts inside `CLIPTextEncode` nodes. A clean declared `prompt` cannot
+ *     launder a graph prompt.
+ *
+ * @example A minimal inline body.
+ * ```ts
+ * const body: WorkflowBody = {
+ *   kind: 'customComfy',
+ *   mode: 'inline',
+ *   resources: ['urn:air:sdxl:checkpoint:civitai:101055@128078'],
+ *   workflow: {
+ *     '1': {
+ *       class_type: 'CheckpointLoaderSimple',
+ *       inputs: { ckpt_name: 'urn:air:sdxl:checkpoint:civitai:101055@128078' },
+ *     },
+ *     '2': {
+ *       class_type: 'CLIPTextEncode',
+ *       inputs: { text: 'a mountain at dawn', clip: ['1', 1] },
+ *     },
+ *     // …sampler, VAE decode, SaveImage…
+ *   },
+ *   prompt: 'a mountain at dawn',
+ *   maxBuzz: 60,
+ * };
+ * ```
+ */
+export type WorkflowBodyCustomComfyInline = {
+  kind: 'customComfy';
+  /**
+   * The arm discriminator. REQUIRED and exactly `'inline'` — omitting it does
+   * not "default to inline because a `workflow` is present"; it routes the body
+   * to the recipe arm, which then rejects it for a missing `recipe`.
+   */
+  mode: 'inline';
+  /**
+   * The ComfyUI `/prompt` graph, keyed by node id (the same object shape
+   * ComfyUI's "Save (API Format)" export produces).
+   *
+   * Server-enforced bounds — all three REJECT, none truncates:
+   *  - at least **1** node, at most **300**;
+   *  - the serialized graph must be at most **262144 bytes** (256 KB);
+   *  - nesting at most **128** levels deep (the gate walks the graph, and a
+   *    graph it cannot finish walking is one it cannot prove safe).
+   */
+  workflow: Record<string, InlineComfyNode>;
+  /**
+   * The DECLARED DOWNLOAD MANIFEST: every resource the graph needs, as an AIR
+   * URN. This is the array the entitlement gate runs over, and gate 1 above is
+   * what makes gating it sufficient.
+   *
+   * 🔴 **Declaring is not optional and it is not inferred.** Every AIR your
+   * graph names must ALSO be listed here or the submit is rejected — and
+   * anything the graph references that is missing from this list would fail at
+   * load time inside ComfyUI anyway. At most **24** entries, each at most 512
+   * characters.
+   *
+   * A `civitai`-sourced AIR MUST carry a model VERSION id
+   * (`urn:air:<ecosystem>:<type>:civitai:<modelId>@<versionId>`) — without one
+   * there is no version to check entitlement against and the body is rejected.
+   * The AIR grammar is read strictly here: all of
+   * `urn:air:<ecosystem>:<type>:<source>:<id>[@<version>]` is required, unlike
+   * the lenient parser used elsewhere.
+   *
+   * The permitted AIR `type`s are model WEIGHTS — `checkpoint`,
+   * `diffusion_model`, `unet`, `lora`, `lycoris`, `dora`, `embedding`,
+   * `hypernet`, `controlnet`, `vae`, `upscaler`, `clip`, `clipvision`,
+   * `text_encoders`, `motion` and a few siblings. An `oci:image` container AIR
+   * is NOT permitted. Anything the allowlist does not name is rejected rather
+   * than passed through.
+   *
+   * Duplicate entries are rejected, not deduped.
+   */
+  resources: string[];
+  /**
+   * The prompt to surface and to audit alongside the graph sweep. Optional
+   * (defaults to `''` server-side) and at most 1500 characters.
+   *
+   * It is NOT the moderation surface on its own — the graph's own strings are
+   * swept too — and it is NOT what generates: the text that generates is
+   * whatever your `CLIPTextEncode` node carries. Set it to the same text so
+   * what you show the user matches what ran.
+   */
+  prompt?: string;
+  /** Optional declared negative prompt, at most 1500 characters. Same posture as {@link prompt}. */
+  negativePrompt?: string;
+  /**
+   * The per-job Buzz ceiling. Required, an integer in **1…250**.
+   *
+   * 🔴 **IT IS ALSO THE STEP TIMEOUT, IN SECONDS.** The host stamps
+   * `stepTimeoutSeconds = maxBuzz` — there is only one number, which is exactly
+   * what makes the ceiling physically enforceable rather than merely asserted.
+   * So `maxBuzz: 10` does not buy a cheap generation; it buys a job that is
+   * KILLED after 10 seconds and comes back `expired`. Size it to the wall-clock
+   * time your graph actually needs, not to what you hope to pay.
+   *
+   * You are billed the REAL cost. Billing is post-paid against measured GPU
+   * seconds and settles to actual, refunding the unused remainder of the
+   * ceiling — so a generous `maxBuzz` costs nothing extra when the job finishes
+   * early. The only thing a low value guarantees is a timeout.
+   *
+   * `estimate` on an inline body echoes this number back as `cost.total`. That
+   * is an upper bound, not a price — surface it as "up to N Buzz". There is no
+   * honest per-graph estimate: the orchestrator forwards the graph opaquely and
+   * cannot price it.
+   *
+   * The host additionally requires `maxBuzz <= token.buzzBudget` before submit;
+   * over-budget comes back as a `failed` snapshot naming both numbers.
+   */
+  maxBuzz: number;
+};
+
+/**
+ * The `customComfy` member of the {@link WorkflowBody} discriminated union
+ * (`kind: 'customComfy'`) — itself a discriminated union on `mode`, mirroring
+ * the host's `blockCustomComfyMemberSchema`:
+ *
+ *  - {@link WorkflowBodyCustomComfyRecipe} (`mode` omitted, or `'recipe'`) —
+ *    names a server-registered, code-reviewed recipe. The default.
+ *  - {@link WorkflowBodyCustomComfyInline} (`mode: 'inline'`) — ships the
+ *    ComfyUI graph itself. Page-tokens-only, and fenced by three server-side
+ *    gates instead of code review. 🔴 NOT developer-only — this line said it was,
+ *    and no `customComfy` arm runs an app-developer check. See that type's own
+ *    doc comment for the refusals that DO run.
+ *
+ * Both arms are `.strict()` server-side, so a body naming BOTH `recipe` and
+ * `workflow` is rejected by both rather than resolved to a winner. Narrow on
+ * `body.mode === 'inline'` — NOT on the presence of a `mode` key, and not on
+ * the presence of a `workflow` key.
+ */
+export type WorkflowBodyCustomComfy =
+  | WorkflowBodyCustomComfyRecipe
+  | WorkflowBodyCustomComfyInline;
+
+/**
+ * The REGISTRY ARM of the `kind: 'step'` member — a **registered orchestrator
+ * step**, submitted through the host's step registry, the uniform bridge for
+ * step types that are not full generation recipes (image conversion, chat
+ * completion, captioning, …).
+ *
+ * 🔴 `kind: 'step'` HAS TWO ARMS, discriminated by whether `step` is present.
+ * This one names a REGISTERED id and the host translates it; the other is
+ * {@link WorkflowBodyPassThroughStep}, which omits `step`, names an orchestrator
+ * `$type` directly and has the host forward `input` unmodified. The trust model
+ * below describes THIS arm only — the pass-through arm deliberately drops four
+ * of these controls, and its own doc comment enumerates which.
+ *
+ * Mirrors the host's `blockStepBodySchema` element-for-element. That schema is
+ * `.strict()` with exactly these three fields, so anything else on this object
+ * is REJECTED server-side rather than dropped.
+ *
+ * Trust / safety model (all SERVER-ENFORCED, same posture as
+ * {@link WorkflowBodyCustomComfy}):
+ *  - `step` is a **registered step id** resolved against a code-reviewed,
+ *    non-DB-editable registry. THIS ARM's wire enum is DERIVED from the registry
+ *    keys, so an unregistered id is rejected **fail-closed at the schema**,
+ *    before any translator, any spend reservation, or any orchestrator call.
+ *    🔴 That is a statement about the REGISTRY ARM, not about `kind: 'step'` as
+ *    a whole: a body that omits `step` lands on
+ *    {@link WorkflowBodyPassThroughStep} instead, where an id the registry has
+ *    never heard of is exactly the supported case.
+ *  - `params` are **bounded and validated per-step** by that step's own
+ *    `.strict()` Zod schema. They are deliberately opaque on the wire (the host
+ *    keeps the transport step-agnostic), so this field is `Record<string,
+ *    unknown>` here and the host's per-step schema is the authority for what a
+ *    given step accepts. An unknown param is a `BAD_REQUEST`, never a silent
+ *    drop.
+ *  - Each entry declares its own billing mode and moderation posture in that
+ *    registry; a step that produces free text has its output scanned before it
+ *    can reach the block.
+ *
+ * Registered ids at the time of writing: `'convert-image'` (fixed-price image
+ * format conversion + resize) and `'chat-completion'` (fixed-price LLM chat
+ * completion over a server-pinned model allowlist). The set grows additively —
+ * `step` is typed `string` rather than a literal union on purpose, because the
+ * registry lives on the host and a pinned union here would go stale against any
+ * host deploy that adds one.
+ */
+export type WorkflowBodyStep = {
+  kind: 'step';
+  /**
+   * A **registered step id** (e.g. `'chat-completion'`). Resolved server-side
+   * against the code-reviewed step registry; on THIS arm an unregistered id is
+   * rejected fail-closed at the wire schema.
+   *
+   * Its presence is also the ARM DISCRIMINATOR. Omit it and the body is read as
+   * a {@link WorkflowBodyPassThroughStep} instead, where an unregistered id is
+   * not rejected because there is no registry lookup at all.
+   */
+  step: string;
+  /**
+   * Bounded, per-step-validated parameters. Only the fields that step's
+   * `.strict()` schema accepts are honored; anything else is rejected.
+   *
+   * For `'chat-completion'` the accepted shape is
+   * `{ model: string; messages: Array<{ role: 'system' | 'user' | 'assistant';
+   * content: string }>; maxTokens: number; temperature?: number }`, where
+   * `model` must be one of the host's allowlisted models and `maxTokens` is
+   * REQUIRED and bounded. Documented rather than typed here: the host's schema
+   * is the single source of truth, and a hand-mirrored param type in this
+   * package would drift against it silently.
+   */
+  params: Record<string, unknown>;
+};
+
+/**
+ * The PASS-THROUGH ARM of the `kind: 'step'` member — the block names an
+ * ORCHESTRATOR `$type` directly and the host forwards `input` **unmodified**.
+ * No registry entry, no server-side translator, no per-step param schema.
+ *
+ * Mirrors the host's `blockPassThroughStepBodySchema`. That schema is
+ * `.strict()` with exactly these fields, so anything else on this object is
+ * REJECTED server-side rather than dropped.
+ *
+ * 🔴 **`step` IS THE ARM DISCRIMINATOR AND IT MUST BE ABSENT.** Send
+ * `{ kind: 'step', $type, input, maxBuzz }` with no `step` key at all. It is
+ * typed `step?: undefined` here so that omitting it satisfies the type while
+ * setting it to anything is a compile error — the host's discriminated union
+ * uses `z.undefined()` for the same job, and a body carrying both `step` and
+ * `$type` is rejected by BOTH arms (each is `.strict()`) rather than resolved to
+ * a winner.
+ *
+ * WHAT THIS ARM GIVES UP relative to {@link WorkflowBodyStep}. Four of the
+ * registry's controls are deliberately absent, by operator decision — this is
+ * documented so it reads as a decision rather than an oversight:
+ *  1. **No per-step `.strict()` param schema.** `input` is opaque; the
+ *     orchestrator's own per-`$type` validation is the only shape gate, and it
+ *     runs AFTER the spend reservation rather than at the wire.
+ *  2. **No moderation posture and no prompt audit.** Nothing audits `input`.
+ *     Moderation moved to the PUBLISH boundary — nothing a block generates is
+ *     public until published, and that path is moderated.
+ *  3. **No resource policy / `urn:air:` scan.** AIR resources are ALLOWED here.
+ *     Spend, not entitlement, is the binding control.
+ *  4. **No `billingMode` and no load-time price invariant.** {@link maxBuzz}
+ *     and a per-request orchestrator `whatif` quote replace them — see
+ *     `maxBuzz` below for how the two combine.
+ *
+ * WHAT STILL BOUNDS IT, all server-side:
+ *  - A **denylist** of platform-internal `$type`s (scanners, moderation
+ *    classifiers, hashing/model-ingestion, web egress) is refused by the host
+ *    router before any spend reservation or orchestrator call. It is a DENYLIST,
+ *    not an allowlist: a `$type` the host has never heard of is allowed through
+ *    by construction, which is the point of this arm. `training` and
+ *    `imageResourceTraining` are deliberately NOT on it (a host operator
+ *    decision): both may be submitted here, on the same terms as every other
+ *    `$type`. If the orchestrator quotes the run, the host reserves the quote
+ *    (or `maxBuzz`, if larger), gated by the token's per-call budget, and
+ *    stamps no timeout; if it does
+ *    not, `maxBuzz` is both the reservation and the timeout — see `maxBuzz`
+ *    below. Whether a given training input is quoted, and at what price, is
+ *    the orchestrator's answer, not this package's: read it from `estimate`.
+ *    A host that supports it reports the trained epochs on
+ *    {@link BlockWorkflowSnapshot.trainedEpochs} without exposing the
+ *    checkpoint itself.
+ *  - `$type` is bounded to **1…64 characters** and `input` to **262144 bytes**
+ *    (256 KB) serialized. Both REJECT; neither truncates.
+ *  - `maxBuzz` is the app's spend knob, and the host's quote can raise the
+ *    reservation above it — see its own note below.
+ *
+ * @example A pass-through body for an orchestrator step the registry does not
+ * carry. Note there is no `step` key.
+ * ```ts
+ * const body: WorkflowBody = {
+ *   kind: 'step',
+ *   $type: 'imageBackgroundRemoval',
+ *   input: { image: 'https://image.civitai.com/…/00001.jpeg' },
+ *   maxBuzz: 10,
+ * };
+ * ```
+ */
+export type WorkflowBodyPassThroughStep = {
+  kind: 'step';
+  /**
+   * 🔴 THE ARM DISCRIMINATOR — **omit this key**. It exists in the type only so
+   * that a body which sets it cannot be mistaken for a pass-through body: the
+   * only assignable value is `undefined`, and the wire payload carries no `step`
+   * key at all (JSON cannot express `undefined`).
+   *
+   * To name a REGISTERED step id instead, you want {@link WorkflowBodyStep}.
+   */
+  step?: undefined;
+  /**
+   * The ORCHESTRATOR step type to run, verbatim — e.g. `'imageBackgroundRemoval'`.
+   * Required, 1…64 characters.
+   *
+   * This is the orchestrator's own `$type` discriminator, NOT a Civitai step-
+   * registry id, and it is not resolved against any allowlist. It is refused
+   * only if it names a platform-internal type (the denylist above; the match is
+   * case-insensitive). The host records the submitted value as the subtype of
+   * the generation it stamps, so a `$type` longer than the cap is rejected
+   * rather than silently degraded.
+   */
+  $type: string;
+  /**
+   * The orchestrator step's own input object, **forwarded unmodified**. The host
+   * does not read, rewrite, merge or default any field in here — that is the
+   * whole point of this arm, and the step the orchestrator receives carries an
+   * `input` byte-identical to this value.
+   *
+   * Consequently the orchestrator's per-`$type` schema is the ONLY authority for
+   * what a given `$type` accepts; nothing in this package or on the host mirrors
+   * it. Bounded only by size: at most **262144 bytes** (256 KB) serialized, which
+   * is a payload-DoS bound and not a shape gate.
+   */
+  input: Record<string, unknown>;
+  /**
+   * The app's declared per-job Buzz amount: the least the host reserves, and —
+   * only when unquoted — the step timeout in seconds. NOT a spend ceiling (see
+   * below). Required, an integer in **1…250**.
+   *
+   * 🔴 **WHAT IT BOUNDS DEPENDS ON WHETHER THE HOST GOT A QUOTE** — this is NOT
+   * the mechanism of {@link WorkflowBodyCustomComfyInline.maxBuzz}, which is
+   * always the timeout. On both `estimate` and `submit` the host first asks the
+   * orchestrator for a `whatif` quote of this exact step, then:
+   *  - **Quoted** — the host reserves `max(maxBuzz, quote)` and stamps NO step
+   *    timeout. That reservation can exceed 250: it is gated against the token's
+   *    per-call budget (`token.buzzBudget` — the app's per-generation budget,
+   *    capped at 1000 when the host mints a production token), and a submit
+   *    whose reservation exceeds that budget comes back `failed` with an
+   *    `insufficient buzz budget` error before any Buzz is reserved.
+   *  - **Unquoted** (the orchestrator returned no price, or the quote could not
+   *    be had) — the host reserves `maxBuzz` and stamps it as the step timeout,
+   *    in seconds. `maxBuzz: 10` then buys a job that is KILLED after 10
+   *    seconds and comes back `expired`, so size it to the wall-clock time the
+   *    step actually needs. The same per-call budget gate applies. The timeout
+   *    bounds wall-clock time; it bounds spend only for a step billed by
+   *    compute time. A step priced per unit can bill ABOVE `maxBuzz`.
+   *
+   * `estimate` on a pass-through body returns, as `cost.total`, the number the
+   * submit would reserve: `max(maxBuzz, quote)`, or `maxBuzz` when unquoted.
+   * It is a reservation, NOT a guaranteed ceiling: the terminal settle refunds
+   * any unused remainder, but nothing on this arm stops a job billing above
+   * the reservation (see the unquoted case above). Do not present it to the
+   * viewer as a maximum.
+   */
+  maxBuzz: number;
+};
+
+// ============================================================
+// App Blocks TRAINING kind (`kind: 'training'`)
+// ============================================================
+//
+// 🔴 MIRRORED FROM THE HOST, NOT DESIGNED HERE. Every type in this section copies
+// civitai/civitai's zod at `a32f506516` (main, after civitai/civitai#5434):
+// `blockTrainingBodySchema` in `src/server/schema/blocks/workflow.schema.ts`, and
+// `aiToolkitTrainingParamsSchema` in `src/server/schema/orchestrator/training.schema.ts`
+// for `params`. The host's zod is the definition; this is the copy. A field the
+// host adds is invisible here until this file is updated, and the host rejects a
+// body that does not parse — so a mismatch shows up as a refused estimate, never
+// as a silently different run.
+
+/** Ceiling on what ONE confirmed `kind: 'training'` run may cost, in Buzz. Host constant `BLOCK_TRAINING_MAX_BUZZ_PER_RUN`. */
+export const BLOCK_TRAINING_MAX_BUZZ_PER_RUN = 5000;
+/** Max images in one prepared training dataset. Host constant `BLOCK_TRAINING_DATASET_MAX_ITEMS`. */
+export const BLOCK_TRAINING_DATASET_MAX_ITEMS = 50;
+/** Max characters of one dataset caption. Host constant `BLOCK_TRAINING_CAPTION_MAX_CHARS`. */
+export const BLOCK_TRAINING_CAPTION_MAX_CHARS = 1000;
+/** Max sample prompts on a training body. Host constant `BLOCK_TRAINING_SAMPLE_PROMPTS_MAX`. */
+export const BLOCK_TRAINING_SAMPLE_PROMPTS_MAX = 6;
+/** Max characters of one sample prompt. Host constant `BLOCK_TRAINING_SAMPLE_PROMPT_MAX_CHARS`. */
+export const BLOCK_TRAINING_SAMPLE_PROMPT_MAX_CHARS = 1000;
+/** Max characters of the trigger word. Host constant `BLOCK_TRAINING_TRIGGER_WORD_MAX_CHARS`. */
+export const BLOCK_TRAINING_TRIGGER_WORD_MAX_CHARS = 64;
+/** Max characters of the base-model key. Host constant `BLOCK_TRAINING_MODEL_KEY_MAX_CHARS`. */
+export const BLOCK_TRAINING_MODEL_KEY_MAX_CHARS = 64;
+
+/** `lrScheduler` values the host's ai-toolkit schema accepts. */
+export type AiToolkitLrScheduler =
+  | 'constant'
+  | 'constant_with_warmup'
+  | 'cosine'
+  | 'linear'
+  | 'step';
+
+/** `optimizerType` values the host's ai-toolkit schema accepts. */
+export type AiToolkitOptimizerType =
+  | 'adamw'
+  | 'adamw8bit'
+  | 'adam8bit'
+  | 'lion'
+  | 'lion8bit'
+  | 'adafactor'
+  | 'adagrad'
+  | 'prodigy'
+  | 'prodigy8bit'
+  | 'automagic';
+
+/** The fields every ai-toolkit ecosystem shares (`aiToolkitBaseParams` on the host). */
+export interface AiToolkitTrainingParamsBase {
+  engine: 'ai-toolkit';
+  /** Saved checkpoint count, integer 1…50. With `steps` absent it is also the length knob. */
+  epochs?: number;
+  /** Total training steps, integer ≥ 1 — the primary length (and price) knob. */
+  steps?: number;
+  /** Integer ≥ 1. Exactly `1` on the `qwen21` / `ming` / `yue2` ecosystems. */
+  batchSize?: number;
+  sampleCfgScale?: number;
+  sampleStrength?: number;
+  continueFrom?: string;
+  resolution: number | null;
+  /**
+   * Learning rate. 🔴 Must be BELOW `0.1` unless `optimizerType` is `prodigy` or
+   * `prodigy8bit` — a host refinement this type cannot express; a body that
+   * breaks it is refused at estimate.
+   */
+  lr: number;
+  textEncoderLr: number | null;
+  trainTextEncoder: boolean;
+  lrScheduler: AiToolkitLrScheduler;
+  optimizerType: AiToolkitOptimizerType;
+  networkDim: number | null;
+  networkAlpha: number | null;
+  noiseOffset: number | null;
+  minSnrGamma: number | null;
+  flipAugmentation: boolean;
+  shuffleTokens: boolean;
+  keepTokens: number;
+  numRepeats?: number;
+}
+
+/**
+ * The ai-toolkit ecosystems that take NO `modelVariant` — send the key absent.
+ * (`qwen21` / `ming` / `yue2` also take none; they live on their own arm of
+ * {@link AiToolkitTrainingParams} because they pin `batchSize` to `1`.)
+ */
+export type AiToolkitPlainEcosystem =
+  | 'sd1'
+  | 'sdxl'
+  | 'chroma'
+  | 'qwen'
+  | 'zimageturbo'
+  | 'zimagebase'
+  | 'ltx2'
+  | 'ltx23'
+  | 'ltx25'
+  | 'minimaxh3'
+  | 'ernie'
+  | 'anima'
+  | 'boogu'
+  | 'krea2'
+  | 'mageflow'
+  | 'ideogram4'
+  | 'ace_step_15';
+
+/**
+ * `params` of a {@link WorkflowBodyTraining} — the host's
+ * `aiToolkitTrainingParamsSchema`, the same schema Civitai's own training form
+ * validates against, discriminated on `ecosystem`.
+ *
+ * ⚠️ THE ECOSYSTEM LIST IS CLOSED HERE AND OPEN ON THE HOST. The host adds
+ * ecosystems over time; until this package mirrors one, a body naming it does not
+ * type-check. That is the cost of a typed copy, paid deliberately: a free
+ * `string` would let a typo through to a refused estimate.
+ */
+export type AiToolkitTrainingParams = AiToolkitTrainingParamsBase &
+  (
+    | { ecosystem: AiToolkitPlainEcosystem; modelVariant?: undefined }
+    | { ecosystem: 'sd3'; modelVariant: 'large' | 'medium' }
+    | { ecosystem: 'flux1'; modelVariant: 'dev' | 'schnell' }
+    | { ecosystem: 'wan'; modelVariant: '2.1' | '2.2' }
+    | { ecosystem: 'flux2klein'; modelVariant: '4b' | '9b' }
+    | { ecosystem: 'qwen21' | 'ming' | 'yue2'; modelVariant?: undefined; batchSize?: 1 }
+    | { ecosystem: 'ace_step_15_xl'; modelVariant: 'base' | 'sft' }
+  );
+
+/**
+ * Train a LoRA with the ai-toolkit engine on a dataset Civitai prepared from the
+ * VIEWER'S OWN images — the App Blocks `kind: 'training'` workflow body.
+ *
+ * ## Availability — read before building on it
+ *
+ *  - 🔴 Behind the host flag **`app-blocks-training-kind`**, which ships OFF and is
+ *    evaluated per viewer. Where it is off, every training call is refused
+ *    (`training from apps is not enabled`).
+ *  - **Page apps only** (`/apps/run/<slug>`). The model slot answers both training
+ *    messages with an error, and the server refuses a non-page token.
+ *  - The manifest must declare **`ai:write:budgeted`** and the viewer must have
+ *    granted it; the viewer must be signed in.
+ *  - **Not from a development or review session**: dev tokens (`dev:live`, dev
+ *    tunnel) and review-sandbox tokens are refused, run-for-real included. Use the
+ *    mock host (`createMockHost` / `Harness`) to build the flow.
+ *
+ * ## The flow
+ *
+ *  1. **Dataset** — `usePrepareTrainingDataset()` (`PREPARE_TRAINING_DATASET`)
+ *     with `[{ imageId, caption }]`. Only the viewer's OWN scanned, unflagged
+ *     images within the page's maturity ceiling are admitted; the rest come back
+ *     in `rejected`. You get an opaque {@link WorkflowBodyTraining.datasetId}.
+ *  2. **Quote** — `useBuzzWorkflow().estimate(body)` with this body, `quoteId`
+ *     ABSENT. The reply's {@link BlockWorkflowSnapshot.trainingQuote} is the
+ *     orchestrator's own price for exactly this run, stored server-side.
+ *  3. **Run** — `useRunTraining().runTraining({ ...body, quoteId })`
+ *     (`RUN_TRAINING`). Civitai shows the viewer a consent dialog in ITS chrome —
+ *     price, base model, length, dataset size, all read back from the server,
+ *     never from your body — and submits only on their click.
+ *  4. **Follow** — `useBuzzWorkflow().watch(snapshot.workflowId)`.
+ *
+ * 🔴 `useBuzzWorkflow().submit()` REFUSES THIS BODY before sending it. The server
+ * charges a training run only against a quote the viewer confirmed from a
+ * signed-in session, which only `RUN_TRAINING`'s dialog can record.
+ *
+ * ## Money
+ *
+ * There is no `maxBuzz` and no timeout knob, on purpose: the price is the quote.
+ * A run may cost more than the token's per-call `buzzBudget` (the viewer confirms
+ * the exact price), up to {@link BLOCK_TRAINING_MAX_BUZZ_PER_RUN} (5,000 Buzz);
+ * an estimate above that is refused.
+ */
+export interface WorkflowBodyTraining {
+  kind: 'training';
+  /** The handle `usePrepareTrainingDataset()` returned — `tds_` + 32 hex characters. */
+  datasetId: string;
+  /** The only engine accepted. */
+  engine: 'ai-toolkit';
+  /**
+   * A base-model key from Civitai's training catalog (1…64 characters), resolved
+   * and gated server-side. Custom AIRs are not accepted.
+   */
+  model: string;
+  params: AiToolkitTrainingParams;
+  /** At most {@link BLOCK_TRAINING_TRIGGER_WORD_MAX_CHARS} characters. Moderated like a prompt. */
+  triggerWord: string;
+  /**
+   * At most {@link BLOCK_TRAINING_SAMPLE_PROMPTS_MAX} prompts of at most
+   * {@link BLOCK_TRAINING_SAMPLE_PROMPT_MAX_CHARS} characters each. Moderated like
+   * prompts.
+   */
+  samplePrompts: string[];
+  /**
+   * The quote this run is charged against — {@link BlockTrainingQuote.quoteId}
+   * from the estimate (`tq_` + 32 hex characters). OMIT it on the estimate;
+   * REQUIRED on `RUN_TRAINING`. The server checks the rest of the body against
+   * the body that was quoted, so change nothing else between the two.
+   */
+  quoteId?: string;
+}
+
+/**
+ * Body the block sends to `useBuzzWorkflow().{submit,estimate}`. A real
+ * discriminated union keyed by `kind`:
+ *  - {@link WorkflowBodyTextToImage} (`kind: 'textToImage'`) — the original
+ *    checkpoint/LoRA/img2img generation body (unchanged, back-compatible).
+ *  - {@link WorkflowBodyCustomComfy} (`kind: 'customComfy'`) — post-paid ComfyUI,
+ *    itself a union on `mode`: a bounded, server-registered
+ *    {@link WorkflowBodyCustomComfyRecipe} (the default), or a
+ *    {@link WorkflowBodyCustomComfyInline} graph the block ships itself
+ *    (`mode: 'inline'`; page-tokens-only, and NOT developer-only — that claim
+ *    used to be here and is false).
+ *  - {@link WorkflowBodyStep} (`kind: 'step'`, `step` PRESENT) — a bounded,
+ *    server-registered orchestrator step (the host's step registry; billing mode
+ *    and moderation posture are declared per entry).
+ *  - {@link WorkflowBodyPassThroughStep} (`kind: 'step'`, `step` ABSENT) — names
+ *    an orchestrator `$type` directly and has the host forward `input`
+ *    unmodified. Bounded by a platform-internal denylist and by `maxBuzz`, not
+ *    by a registry.
+ *  - {@link WorkflowBodyTraining} (`kind: 'training'`) — an ai-toolkit LoRA run
+ *    on a server-prepared dataset of the viewer's own images. ESTIMATE ONLY
+ *    through `useBuzzWorkflow`; it runs through `useRunTraining()`, whose
+ *    host-chrome consent dialog is the only way to confirm its quote.
+ *
+ * `kind: 'step'` is therefore itself a union, discriminated on the PRESENCE of
+ * `step` — the same nesting {@link WorkflowBodyCustomComfy} has on `mode`.
+ * Narrowing on `kind === 'step'` alone leaves both arms in play; narrow further
+ * with `'$type' in body` (or `body.step === undefined`) before touching
+ * arm-specific fields.
+ *
+ * New kinds extend this union as the host gains support for them. Narrow on
+ * `body.kind` before touching member-specific fields (e.g. `modelId`/`params`
+ * live only on the `textToImage` member).
+ *
+ * ⚠️ Adding a member is additive for PRODUCERS (every existing body still
+ * satisfies the union) but narrowing for CONSUMERS that `switch` exhaustively
+ * over `kind`. Host code that must handle every member gets a compile error
+ * pointing at the new one, which is the intended behaviour.
+ */
+export type WorkflowBody =
+  | WorkflowBodyTextToImage
+  | WorkflowBodyCustomComfy
+  | WorkflowBodyStep
+  | WorkflowBodyPassThroughStep
+  | WorkflowBodyTraining;
+
+/**
+ * The host-mediated view of an orchestrator workflow that an iframe block
+ * receives over `postMessage`.
+ *
+ * This is intentionally a flattened **subset** of `WorkflowSnapshot` from
+ * `../orchestrator/` — the host (civitai.com) maps the full orchestrator
+ * payload down to this shape before forwarding. Notable differences:
+ * - `workflowId` here = orchestrator's `id`
+ * - `imageUrls` here = flattened from `steps[].output.images[].url`
+ * - `cost.total` is the host-attested total (not the raw orchestrator field)
+ * - the status union omits orchestrator-internal states like `unassigned`
+ *
+ * If the orchestrator gains a status the host doesn't recognize, the host
+ * is responsible for mapping it to one of the values here (typically
+ * `processing` or `failed`).
+ */
+export interface BlockWorkflowSnapshot {
+  workflowId: string;
+  status: 'pending' | 'processing' | 'succeeded' | 'failed' | 'expired' | 'canceled';
+  cost?: { total: number };
+  imageUrls?: string[];
+  error?: string;
+  /**
+   * The Buzz pool that was the PRIMARY FUNDER of this generation — i.e. the
+   * account with the LARGEST debit, which the host stamps onto the workflow
+   * snapshot server-side. This is NOT necessarily "the paid account": a
+   * generation covered mostly by free/earned Buzz reports `spentAccountType:
+   * 'blue'`. Populated by the host from the Phase-1 backend `spentAccountType`
+   * field; absent when the host predates it or no spend occurred. Informational
+   * only — surface it (e.g. "funded from your yellow balance") but don't gate on it.
+   */
+  spentAccountType?: BuzzAccountType;
+  /**
+   * Set when the host opportunistically claimed a Buzz reward on the user's
+   * behalf during submit. Currently the host only fires this for the daily
+   * boost (25 blue Buzz, one per UTC day) when the user's balance would
+   * otherwise have been short by less than the boost amount.
+   *
+   * Informational only — the block has no obligation to reconcile state
+   * (the claim already settled in the orchestrator). A typical block UX
+   * surfaces a small "+25 daily boost claimed" notice next to the
+   * succeeded result.
+   */
+  autoClaim?: {
+    type: 'dailyBoost';
+    amount: number;
+    accountType: 'yellow' | 'blue' | 'red' | 'green';
+  };
+  /**
+   * Checkpoint versions the host SILENTLY replaced before running the
+   * generation. `requested` is the version id the block asked for, `applied` is
+   * the one that actually ran (and was billed).
+   *
+   * On an ecosystem whose model is locked to a workflow, the host swaps a
+   * version id that is not offered for the current workflow for that workflow's
+   * default and still succeeds — graceful degradation that keeps an app pinned
+   * to a since-retired version working. This field only REPORTS the swap; the
+   * behaviour is unchanged.
+   *
+   * WHERE IT APPEARS: on the `kind: 'textToImage'` path only — the submit reply,
+   * the estimate reply, every submit reply that quotes a cost without
+   * submitting, and every later poll/cancel of that workflow (the record is
+   * persisted with it, so it sits next to the `imageUrls` it describes). An
+   * estimate creates no persisted workflow, so there it exists only on that
+   * reply. It does NOT appear for `customComfy` or `step` bodies: neither
+   * resolves a checkpoint, so there is nothing to substitute.
+   *
+   * OMITTED entirely when nothing was substituted. Absent on hosts that predate
+   * it.
+   */
+  modelSubstitutions?: BlockModelSubstitution[];
+  /**
+   * Generated FREE TEXT produced by a registered text-output step (e.g.
+   * `chat-completion`) — every string here has PASSED the host's output
+   * moderation scan.
+   *
+   * WHERE IT APPEARS: the poll and cancel replies (`poll()` / `cancel()` /
+   * `watch()` on `useBuzzWorkflow`). NOT on the submit reply — a submit returns
+   * a freshly-queued workflow with no output yet, so poll for the text. Also
+   * never on {@link AppWorkflow}, which has no text field.
+   *
+   * OMITTED entirely when there is no text. Independent of
+   * {@link BlockWorkflowSnapshot.textOutputWithheld}: a workflow with two text
+   * steps can release one and withhold the other, and both fields then appear.
+   */
+  textOutputs?: string[];
+  /**
+   * Set when a text-output step produced nothing the block can be given, with a
+   * user-facing sentence saying why. TWO distinct causes land here:
+   *
+   *   1. WITHHELD — text WAS produced and is being kept back: a content-policy
+   *      hit, or any other fail-CLOSED scan outcome (scanner error or timeout,
+   *      no verdict at all, an over-cap payload, or requested labels that came
+   *      back missing or errored). Every one of those paths returns the SAME
+   *      message, so this cause is one string with several origins.
+   *   2. UNPUBLISHABLE — the step SUCCEEDED and the scan RELEASED, but none of
+   *      what came back could be published (e.g. a provider tool-call `id`
+   *      outside the published charset). Nothing was moderated in this case,
+   *      and the message says so explicitly.
+   *
+   * `reason` is deliberately generic: it does not name the labels that
+   * triggered.
+   *
+   * 🔴 THE TWO CAUSES ARE NOT MACHINE-SEPARABLE without matching on the string,
+   * which is NOT a contract. Do not branch on the text of `reason`.
+   *
+   * 🔴 ONLY CAUSE 2 IS STATUS-GATED, and that gate reads the STEP's own
+   * `succeeded` status — never the workflow's. Cause 1 is not gated at all, so a
+   * CANCELLED generation CAN still set this field: the orchestrator returns
+   * whatever text it had already produced, that text is still scanned, and a
+   * hit still withholds it. A block that skips rendering `reason` on cancel
+   * would suppress a real content-policy explanation.
+   *
+   * A block polling a healthy in-flight generation sees the field absent — not
+   * because of its status, but because a step that has produced no text yet can
+   * reach neither cause.
+   *
+   * Independent of {@link BlockWorkflowSnapshot.textOutputs} rather than
+   * mutually exclusive, so `reason` is scoped to "a step in this response",
+   * never to the response as a whole. Same appearance rules as `textOutputs`.
+   */
+  textOutputWithheld?: { reason: string };
+  /**
+   * Structured tool calls the model requested on a registered text-output step
+   * (e.g. `chat-completion` with tools), which have PASSED the same output
+   * moderation scan as {@link BlockWorkflowSnapshot.textOutputs}: every
+   * `arguments` string here was part of the text the scan released. The tool
+   * `name` is restricted to `[A-Za-z0-9_-]`, so it cannot carry prose.
+   *
+   * Each entry is fully populated — the host drops a call it cannot fill
+   * completely rather than publishing a partial one.
+   *
+   * Same appearance rules as `textOutputs` (poll and cancel replies only).
+   * OMITTED entirely when there are none.
+   */
+  toolCalls?: BlockStepToolCall[];
+  /**
+   * The raw orchestrator output of each PASS-THROUGH step
+   * ({@link WorkflowBodyPassThroughStep}: `kind: 'step'` with a `$type`), as
+   * `{ $type, output }`, forwarded as-is — minus its blobs.
+   *
+   * Blob-SHAPED values are removed from `output`; their available urls go to
+   * {@link BlockWorkflowSnapshot.imageUrls} (and to {@link AppWorkflow.images})
+   * instead, so a pass-through step does not open a second image channel.
+   * "Blob-shaped" is the exact scope of that: a url held in a plain string
+   * field of the output is not a blob and can still appear here.
+   *
+   * 🔴 UNSCANNED. Unlike `textOutputs`, no moderation scan runs over this
+   * field; moderation for the pass-through arm happens at the publish boundary.
+   * Treat any text in it accordingly.
+   *
+   * 🔴 A `$type` that is ALSO a registered step's orchestrator type (e.g.
+   * `chatCompletion`, which `chat-completion` uses) is handled by that
+   * registered step instead — its text arrives on `textOutputs`, scanned, and
+   * it does not appear here. Which channel a pass-through `$type` lands on can
+   * therefore change the day the host registers a step for it.
+   *
+   * `output` is `unknown`: its shape is whatever the orchestrator returns for
+   * that `$type`. OMITTED entirely when the workflow has no pass-through step
+   * with an unregistered `$type`.
+   */
+  stepOutputs?: Array<{ $type: string; output: unknown }>;
+  /**
+   * The epochs of a pass-through `training` / `imageResourceTraining` step
+   * (see {@link WorkflowBodyPassThroughStep}) that PRODUCED A CHECKPOINT — one
+   * entry per epoch, each naming the step's `$type` and its `epochNumber`.
+   * Only runs whose training moderation status is approved are listed; an
+   * unmoderated or refused run reports no epochs.
+   *
+   * 🔴 THE CHECKPOINT ITSELF IS DELIBERATELY NOT EXPOSED — this field carries
+   * no download url. (An older host may still surface checkpoint urls in
+   * `imageUrls` or `stepOutputs` for a training step; that is a host defect,
+   * not a contract — never treat an `imageUrls` entry as a checkpoint.) To
+   * publish a trained epoch, navigate the viewer to Civitai's own model wizard:
+   *
+   * ```ts
+   * const { navigate } = useCivitaiNavigate();
+   * navigate(
+   *   `models/train/from-orchestrator?workflowId=${snapshot.workflowId}&epoch=${epoch.epochNumber}`,
+   *   { scope: 'site' },
+   * );
+   * ```
+   *
+   * The viewer completes (or abandons) the publish there, on Civitai's surface;
+   * {@link BlockWorkflowSnapshot.publishedModel} then reports the result.
+   *
+   * 🔴 REQUIRES A HOST VERSION THAT EMITS IT. Absent on older hosts — treat
+   * absence as "unknown", not as "no checkpoint". The run's spend and timeout
+   * follow the pass-through arm's rules — see
+   * {@link WorkflowBodyPassThroughStep.maxBuzz}.
+   */
+  trainedEpochs?: BlockTrainedEpoch[];
+  /**
+   * The Civitai model this run has been published as — present once the viewer
+   * has STARTED or FINISHED publishing it through the model wizard reached from
+   * {@link BlockWorkflowSnapshot.trainedEpochs}. `published` is `false` while the
+   * model is still a draft and `true` once it is published.
+   *
+   * 🔴 REQUIRES A HOST VERSION THAT EMITS IT. Absent on older hosts, and absent
+   * on any run nobody has started publishing.
+   */
+  publishedModel?: BlockPublishedModel;
+  /**
+   * The quote a {@link WorkflowBodyTraining} ESTIMATE produced — the orchestrator's
+   * own price for exactly that run, stored server-side. Pass
+   * `trainingQuote.quoteId` back as the body's `quoteId` on
+   * `useRunTraining().runTraining()`; the consent dialog then shows the viewer
+   * this price, read back from the server.
+   *
+   * `cost.total` on the same snapshot equals `trainingQuote.total`.
+   * `expiresAt` is an ISO-8601 timestamp: after it the run is refused and you
+   * estimate again. `imageCount` is the server-derived size of the prepared
+   * dataset, never a number the block sent.
+   *
+   * Present ONLY on the reply to a `kind: 'training'` estimate. Absent on hosts
+   * that predate civitai/civitai#5434.
+   */
+  trainingQuote?: BlockTrainingQuote;
+}
+
+/** {@link BlockWorkflowSnapshot.trainingQuote}. */
+export interface BlockTrainingQuote {
+  /** `tq_` + 32 hex characters. Opaque — pass it back verbatim. */
+  quoteId: string;
+  /** The quoted price, in Buzz. */
+  total: number;
+  /** How many images the prepared dataset holds. */
+  imageCount: number;
+  /** ISO-8601. The quote cannot be run after this. */
+  expiresAt: string;
+}
+
+/**
+ * Why the host substituted a checkpoint version — see
+ * {@link BlockWorkflowSnapshot.modelSubstitutions}.
+ *
+ *  - `'wrong-workflow'` — the id IS one of this ecosystem's workflow-scoped
+ *    versions, but for a DIFFERENT workflow (e.g. an edit-only version sent to
+ *    text-to-image).
+ *  - `'unrecognized'` — the id is in no scoped list for this ecosystem: a
+ *    community checkpoint, or a version retired since the app shipped.
+ *  - `'gated'` — the id IS offered for this workflow, but a gate rule hid it
+ *    from THIS viewer. The app is not wrong; the viewer may not use it.
+ *
+ * The host may add a reason in a later version, and the SDK's inbound
+ * validator does not reject an unrecognised one — handle an unknown value as a
+ * generic substitution rather than assuming the list is closed.
+ */
+export type ModelSubstitutionReason = 'wrong-workflow' | 'unrecognized' | 'gated';
+
+/** One entry of {@link BlockWorkflowSnapshot.modelSubstitutions}. */
+export interface BlockModelSubstitution {
+  /** The checkpoint version id the block asked for. */
+  requested: number;
+  /** The checkpoint version id that actually ran. */
+  applied: number;
+  reason: ModelSubstitutionReason;
+}
+
+/** One entry of {@link BlockWorkflowSnapshot.toolCalls}. */
+export interface BlockStepToolCall {
+  id: string;
+  /**
+   * The SDK's inbound validator checks only that it is a string, so a value
+   * the host adds later can arrive — do not assume `'function'` exhaustively.
+   */
+  type: 'function';
+  function: {
+    /** Restricted to `[A-Za-z0-9_-]`. */
+    name: string;
+    /** The model's arguments, as the JSON string it produced. Scanned. */
+    arguments: string;
+  };
+}
+
+/** One entry of {@link BlockWorkflowSnapshot.trainedEpochs} / {@link AppWorkflow.trainedEpochs}. */
+export interface BlockTrainedEpoch {
+  /**
+   * Which pass-through training `$type` produced this epoch. The SDK's inbound
+   * validator checks only that it is a string, so a value the host adds later
+   * can arrive — give an exhaustive `switch` a default branch.
+   */
+  $type: 'training' | 'imageResourceTraining';
+  /** Pass as `epoch` to the `/models/train/from-orchestrator` wizard route. */
+  epochNumber: number;
+}
+
+/**
+ * The model a training run was published as —
+ * {@link BlockWorkflowSnapshot.publishedModel} / {@link AppWorkflow.publishedModel}.
+ */
+export interface BlockPublishedModel {
+  modelId: number;
+  modelVersionId: number;
+  /** `false` while the model is still a draft in the wizard; `true` once published. */
+  published: boolean;
+}
+
+// ============================================================
+// Manifest
+// ============================================================
+
+/**
+ * Which side of the settings split a field lives on.
+ * - `publisher`: stored on `model_block_installs.settings` (or a publisher
+ *   subscription row). The model owner / app installer controls it.
+ * - `viewer`: stored on `block_user_settings.settings` (or a viewer
+ *   subscription row). Each signed-in user controls their own value.
+ */
+export type SettingScope = 'publisher' | 'viewer';
+
+/**
+ * Widget hints the platform's generic SettingsForm renderer consumes.
+ * `resource_picker` is the v0 escape hatch for the checkpoint case —
+ * delegates to `useCheckpointPicker` (or a future generic picker hook)
+ * via the host bridge.
+ */
+export type SettingWidget =
+  | 'number'
+  | 'slider'
+  | 'resource_picker'
+  | 'text'
+  | 'textarea'
+  | 'select'
+  | 'toggle';
+
+interface ManifestSettingFieldBase {
+  scope: SettingScope;
+  label: string;
+  description: string;
+  /**
+   * Hide the field when this scope isn't in the app's declared scopes.
+   * Lets a manifest carry a "Max Buzz per generation" field that only
+   * renders for apps that requested `ai:write:budgeted`.
+   */
+  requires_scope?: string;
+}
+
+export interface ManifestNumberField extends ManifestSettingFieldBase {
+  type: 'number';
+  widget?: 'number' | 'slider' | 'resource_picker';
+  default?: number | null;
+  min?: number;
+  max?: number;
+  step?: number;
+  /**
+   * Widget-specific config. For `resource_picker`:
+   *   `{ resource_type: 'Checkpoint' | 'LORA' | ..., filter_by_ecosystem?: boolean }`.
+   */
+  widget_options?: Record<string, unknown>;
+}
+
+export interface ManifestStringField extends ManifestSettingFieldBase {
+  type: 'string';
+  widget?: 'text' | 'textarea' | 'select';
+  default?: string | null;
+  max_length?: number;
+  /** RegExp source. Compiled at validate-time. */
+  pattern?: string;
+  /** Required when `widget === 'select'`. */
+  enum?: string[];
+}
+
+export interface ManifestBooleanField extends ManifestSettingFieldBase {
+  type: 'boolean';
+  widget?: 'toggle';
+  default?: boolean;
+}
+
+export type ManifestSettingField =
+  | ManifestNumberField
+  | ManifestStringField
+  | ManifestBooleanField;
+
+/**
+ * W3 v0 manifest settings declaration. Keyed by snake_case field name.
+ * Mirrors `manifestSettingsSchema` in civitai/civitai's
+ * `src/server/schema/blocks/manifest-settings.meta.schema.ts`. Keep in
+ * lockstep — adding a field type or widget on one side without the other
+ * will silently degrade the form renderer or the platform validator.
+ */
+export type ManifestSettings = Record<string, ManifestSettingField>;
+
+export type ContentRating = 'g' | 'pg' | 'pg13' | 'r' | 'x';
+
+export interface ManifestTarget {
+  slotId: string;
+  /**
+   * Slot ordering hint. NOT a property of the canonical schema (whose target
+   * items require only `slotId`), so it is optional and shape-checked only.
+   */
+  priority?: number;
+  requiredContext?: string[];
+}
+
+/**
+ * iframe envelope. Every field is optional — the canonical schema declares no
+ * `required` list here, and the platform supplies its own defaults.
+ */
+export interface ManifestIframe {
+  /**
+   * SERVER-OWNED — the platform stamps the canonical bundle URL at
+   * build/approve time. Typed `never` so setting it is a compile error;
+   * `defineBlock` rejects it at runtime too. Until #330 the SDK REQUIRED this
+   * field, which made every valid manifest fail local validation and every
+   * locally-valid manifest fail `civitai app submit`.
+   */
+  src?: never;
+  /** Canonical bounds: integer, 40–4000 px. */
+  minHeight?: number;
+  /** Optional. Omit or set to `null` for no cap. Canonical bounds: 40–4000 px. */
+  maxHeight?: number | null;
+  resizable?: boolean;
+  sandbox?: string;
+}
+
+/** Full-page surface descriptor (W10). Page apps mount at `/apps/run/<slug>`. */
+export interface ManifestPage {
+  /** Sub-path the page mounts at; must start with `/`. */
+  path: string;
+  /** Title shown in host chrome. */
+  title: string;
+  icon?: string;
+  /**
+   * Per-generation Buzz SAFETY CEILING for `ai:write:budgeted` tokens — a
+   * ceiling against a drained wallet, NOT a cost forecast. Size it well above
+   * your worst-case generation; a budget set to your estimate becomes a hard
+   * outage the moment real cost drifts up.
+   */
+  buzzBudgetPerGen?: number;
+}
+
+export interface ManifestPreview {
+  thumbnail: string;
+  description: string;
+  screenshots?: string[];
+}
+
+/**
+ * One entry of a manifest's `goods[]`. Mirrors the canonical schema exactly;
+ * `id`, `title` and `priceBuzz` are required there and so are they here.
+ *
+ * 🔴 DECLARED BEFORE `BlockManifestV1`'S DOCBLOCK ON PURPOSE. Inserting an
+ * interface BETWEEN a docblock and the declaration it documents does not just
+ * look untidy — `tsc` emits both comments onto THIS interface in
+ * `dist/blocks/types.d.ts` and leaves `BlockManifestV1` undocumented, so the
+ * published types told a reader that "only `blockId`, `version`, `name`,
+ * `contentRating` and `scopes` are required" about a type with three fields and
+ * different requirements. Keep any new sibling above this comment or below
+ * `BlockManifestV1`.
+ */
+export interface BlockManifestGood {
+  /** Lowercase alphanumeric with `-`/`_`, at most 64 chars. Colon-free, because it is composed into a redis key and a ledger external id. */
+  id: string;
+  /** At most 80 chars. */
+  title: string;
+  /** At most 500 chars. */
+  description?: string;
+  /**
+   * Whole Buzz, minimum 2 — at a price of 1 the owner's floored 70% share is
+   * ZERO, so the app would sell an item and earn nothing from it, permanently.
+   */
+  priceBuzz: number;
+  /**
+   * What the entitlement grants. `app_unlock` marks a one-time unlock of the app
+   * itself; it is RECORDED identically today and the platform does not yet act
+   * on it, so declaring it buys nothing unless you intend that later behaviour.
+   *
+   * 🔴 `app_unlock` carries THREE extra rules the platform validator enforces and
+   * this schema does not express: `priceBuzz` at most 5000 (not the 50000 the
+   * `priceBuzz` bound allows), at most ONE `app_unlock` good per manifest, and a
+   * mandatory `justification`. Local validation passing is necessary, not
+   * sufficient — see the canonical schema's `kind` description.
+   */
+  kind?: 'good' | 'app_unlock';
+  /**
+   * Why this good exists, shown to the moderator at review and never to the
+   * viewer. REQUIRED when `kind` is `'app_unlock'`: adding an unlock turns a free
+   * app into a paid one, and because an unlock does not require the sensitive
+   * `goods:purchase:self` scope, this is what makes that a reviewed decision
+   * rather than a diff nobody was pointed at. Optional for an ordinary good.
+   * Review metadata only — unlike `payload` it is never copied onto an
+   * entitlement, and the platform does not verify the claim. At most 500 chars.
+   */
+  justification?: string;
+  /** Opaque app payload, carried verbatim onto the entitlement. Never interpreted by the platform. */
+  payload?: Record<string, unknown>;
+}
+
+/**
+ * v1 manifest shape. Mirrors `schemas/app-block/v1.json` — keep them in sync.
+ *
+ * REQUIRED HERE = REQUIRED THERE. Only `blockId`, `version`, `name`,
+ * `contentRating` and `scopes` are required, because those are exactly the five
+ * entries in the canonical schema's `required` array. Before #330 this
+ * interface required eleven (including `appId`, which the canonical does not
+ * declare at all, and `iframe.src`, which the platform REFUSES), so the type
+ * itself rejected every manifest the starters ship.
+ */
+export interface BlockManifestV1 {
+  /**
+   * Optional JSON-Schema reference. The canonical types it as a plain string
+   * and its own description says it is "ignored by the platform validator", so
+   * `defineBlock` does NOT constrain the value — point it at a vendored copy or
+   * a preview draft if that is what your editor needs. Until #330 a mismatch
+   * was a hard throw, which (once the gate was wired into Vite) failed the
+   * build on a field the server provably ignores.
+   *
+   * The union below is an AUTOCOMPLETE NUDGE, not a rule: `string & {}` keeps
+   * the literal visible in editor suggestions while still admitting any string.
+   */
+  $schema?: 'https://civitai.com/schemas/app-block/v1.json' | (string & {});
+  /**
+   * NOT a canonical manifest property, and NOT validated. Your app id lives in
+   * `civitai.app.json` (`{"appId": "..."}`), which is what the `civitai` CLI
+   * reads. The canonical does not forbid extra top-level keys, so the server
+   * ignores this one; the scaffolds still carry `"app_REPLACE_ME"` and it is
+   * inert.
+   */
+  appId?: string;
+  blockId: string;
+  version: string;
+  /** Human-readable display name. Non-empty; the canonical imposes NO length cap. */
+  name: string;
+  /** Canonical enum — `block` is the only member. */
+  type?: 'block';
+  /** Optional (page-only apps declare none). Canonical cap: 16 entries. */
+  targets?: ManifestTarget[];
+  scopes: string[];
+  /**
+   * Optional per-scope justification: a map of scope-id → free-text rationale
+   * (WHY the app needs that permission), shown to the moderator during review.
+   * Backward-compatible — omit it and the manifest stays valid; `scopes` is
+   * unchanged. Every key MUST be a scope also present in `scopes`; each value is
+   * a non-empty string of at most 500 chars. Captures the developer's STATED
+   * rationale only — the platform does not verify the claims. Kept in lockstep
+   * with the canonical schema's `scopeJustifications` (civitai #3195).
+   */
+  scopeJustifications?: Record<string, string>;
+  /**
+   * Optional DIGITAL GOODS catalog — entitlements the platform sells to a viewer
+   * for Buzz on this app's behalf. Manifest-governed and REVIEW-GATED: the
+   * catalog a moderator approves is the catalog that can be sold, and changing a
+   * price means shipping a new version and being re-reviewed.
+   *
+   * Declaring goods is not by itself permission to sell — the manifest must also
+   * carry `goods:purchase:self` in `scopes`.
+   *
+   * 🔴 THE TYPE WAS ABSENT WHILE THE SCHEMA PROPERTY EXISTED, so `defineBlock`'s
+   * documented inline-literal form rejected a `goods` declaration with TS2353
+   * even though Ajv accepted the same manifest from a JSON file. Nothing could
+   * catch that: there is a vendored-schema↔`BLOCK_SCOPES` cross-check but no
+   * schema-properties↔interface-keys check, and the repo's manifest tests cast.
+   * Kept in lockstep with the canonical schema's `goods`.
+   */
+  goods?: BlockManifestGood[];
+  /** Optional; the canonical declares no required sub-field. */
+  iframe?: ManifestIframe;
+  /** Full-page surface descriptor (W10). */
+  page?: ManifestPage;
+  /**
+   * The app's shipped `index.html` paints its own loading state inside `#root`,
+   * so the full-page run host stands down its branded overlay. Only declare it
+   * if the markup really exists — with the overlay gone, an empty `#root` is a
+   * blank iframe for the whole load.
+   */
+  bootSkeleton?: boolean;
+  /**
+   * Per-field settings declaration the platform validates user input
+   * against AND renders the publisher/viewer settings UI from. v0 shape;
+   * see {@link ManifestSettings}.
+   */
+  settings?: ManifestSettings;
+  contentRating: ContentRating;
+  /**
+   * Optional marketplace category for the app's `/apps` store listing. When
+   * present it flows to the listing automatically on moderator-approve (only
+   * when a mod has not already curated one). Omit to let a moderator
+   * categorise. One of {@link BlockCategory} — kept in lockstep with the
+   * canonical schema's `category` enum and MARKETPLACE_CATEGORIES on the server.
+   */
+  category?: BlockCategory;
+  /**
+   * Optional one-line pitch shown under the app's name on its `/apps` store card
+   * + detail page. Manifest-governed: it flows to the store listing on
+   * moderator-approve and is re-synced from the manifest on every subsequent
+   * approved version — for an ON-SITE app the manifest is the ONLY surface that
+   * sets it. Omit it and the store simply shows no tagline. Capped at
+   * {@link BLOCK_TAGLINE_MAX_LENGTH} (140) characters, the same bound off-site
+   * listings use, so both store kinds render the same slot. Kept in lockstep with
+   * the canonical schema's `tagline` (civitai #3441). NOTE the canonical counts
+   * the RAW string while the server measures the trimmed one, and `defineBlock`
+   * takes the canonical's verdict — so trim before you count.
+   */
+  tagline?: string;
+  /**
+   * Optional PUBLIC source-repository link rendered as a `Source` row on the
+   * app's store detail page. `https://` root URL on github.com, gitlab.com or
+   * codeberg.org, at most 200 chars. `defineBlock` mirrors the canonical's
+   * COARSE pattern; the server applies stricter per-segment rules, so passing
+   * locally is necessary, not sufficient.
+   */
+  repository?: string;
+  preview?: ManifestPreview;
+  promotionEligible?: boolean;
+  /** Optional; dot-separated integers (e.g. `"1"` or `"1.0"`). Informational. */
+  minApiVersion?: string;
+  /**
+   * Author-declared mode preference. `hybrid` is a manifest-only hint that
+   * the host resolves to a concrete `iframe` | `inline` value before sending
+   * `BLOCK_INIT` — that's why `BlockInitPayload.renderMode` is narrower.
+   */
+  renderMode?: 'iframe' | 'inline' | 'hybrid';
+  /**
+   * Which credential the host hands the block. OPTIONAL, and the canonical does
+   * NOT list it in `required`: omitting it means `"block-token"` — the
+   * block-scoped JWT that `BLOCK_INIT` already carries. `"oauth"` opts the block
+   * into a real OAuth access token for its own `OauthClient`, accepted unchanged
+   * by `/api/v1`, the orchestrator and the MCP. Kept in lockstep with the
+   * canonical schema's `auth` enum; `defineBlock` derives the runtime check from
+   * the vendored schema, so the two cannot disagree on the accepted values.
+   */
+  auth?: 'block-token' | 'oauth';
+  /**
+   * Config-as-code: the command the platform runs to build the static bundle.
+   * One of an allowlisted set (`npm|pnpm|yarn run <script>`, `vite build`,
+   * `npx vite build`). When set, `outputDir` is REQUIRED.
+   */
+  buildCommand?: string;
+  /** Directory `buildCommand` emits into. Safe relative path; required with `buildCommand`. */
+  outputDir?: string;
+  /** Allowlist of settings keys exposed to anonymous viewers. Max 32 keys, 64 chars each. */
+  publicSettingsKeys?: string[];
+  /** Optional v2 surface — a public `https://` URL to a hosted asset bundle. */
+  assetBundleUrl?: string;
+  assetBundle?: { url: string | null; sha256: string | null };
+  /**
+   * SERVER-OWNED — the platform assigns the trust tier during review. Typed
+   * `never` so setting it is a compile error; `defineBlock` rejects it at
+   * runtime too.
+   */
+  trustTier?: never;
+}
+
+export type BlockManifest = BlockManifestV1;
+
+// ============================================================
+// Buzz self-read + wildcard-pack bridge result types
+// ============================================================
+
+/**
+ * One buzz-transaction row as the host projects it for a block, on the wire in
+ * `BUZZ_TRANSACTIONS_RESULT`.
+ *
+ * Mirrors civitai/civitai's `projectBlockBuzzTransaction`
+ * (`src/server/services/blocks/block-buzz-read.projection.ts`) — keep in
+ * lockstep. The host deliberately STRIPS the sensitive fields the raw ledger
+ * carries: `details` is allowlisted to the entity-attribution keys (the
+ * passthrough — incl. `stripePaymentIntentId` — is dropped), and
+ * `externalTransactionId` is nulled by the host on EVERY block-facing row
+ * (default-deny; civitai/civitai #3192) — the field stays on the wire for
+ * shape-compat but is always `null` for blocks.
+ *
+ * DATE WIRE CAVEAT: `date` is documented as ISO-8601 to match the SDK's
+ * wire convention, BUT the host currently forwards the raw tRPC `result` over a
+ * structured-clone `postMessage` (it does NOT `.toISOString()`-map it the way
+ * the `SHARED_LIST` bridge does), so at runtime `date` arrives as a `Date`
+ * INSTANCE. The block-side guard + `useBuzzTransactions` hook tolerate BOTH a
+ * `Date` and an ISO string (rehydrating to `Date`), so either representation
+ * round-trips correctly. See `civitai-blocks-react`'s `isValidBuzzTransactionsResult`.
+ */
+export interface BlockBuzzTransaction {
+  /** ISO-8601 on the wire (a `Date` instance at runtime today — see the caveat above). */
+  date: string;
+  /** The `TransactionType` enum NAME (e.g. `'Tip'`, `'Purchase'`), never the numeric value. */
+  type: string;
+  amount: number;
+  fromAccountId: number;
+  toAccountId: number;
+  /** Buzz pool name (e.g. `'yellow'`, `'blue'`, `'cashSettled'`). */
+  fromAccountType: string;
+  toAccountType: string;
+  description?: string | null;
+  /**
+   * Entity-attribution fields ONLY — the host allowlists these five keys and
+   * drops every passthrough key (incl. `stripePaymentIntentId`).
+   */
+  details?: {
+    user?: string;
+    entityId?: number;
+    entityType?: string;
+    url?: string;
+    toAccountType?: string;
+  } | null;
+  /** Always `null` for blocks — the host nulls it on every row (default-deny; #3192). Present for wire-compat. */
+  externalTransactionId: string | null;
+  fromUser?: { id: number; username: string | null };
+  toUser?: { id: number; username: string | null };
+}
+
+/**
+ * One all-pool balance row on the wire in `BUZZ_ACCOUNTS_RESULT`. Mirrors
+ * civitai/civitai's `blocks.getMyBuzzAccounts` projection (`{ accountType,
+ * balance }` for each pool in `blockBuzzAccountTypes` — the three spendable pools
+ * PLUS the creator payout pools) — keep in lockstep.
+ */
+export interface BlockBuzzAccount {
+  /** Buzz pool name — a spendable pool or a creator payout pool. */
+  accountType: string;
+  balance: number;
+}
+
+/**
+ * One model-version's generation-compensation row for the month containing the
+ * requested `date`, on the wire in `DAILY_COMPENSATION_RESULT`. Mirrors
+ * civitai/civitai's `getDailyCompensationRewardByUser`
+ * (`src/server/services/buzz.service.ts`) — keep in lockstep. `data` totals are
+ * Buzz; `cashData` totals are in pennies (`cashCents` is their sum). The
+ * per-day `createdAt` is a `YYYY-MM-DD` day-string (NOT a full ISO timestamp),
+ * so — unlike a transaction's `date` — it is NOT rehydrated to a `Date`.
+ */
+export interface BlockDailyCompensationResource {
+  id: number;
+  name: string;
+  modelName: string;
+  /** Per-day Buzz totals; `createdAt` is a `YYYY-MM-DD` day-string. */
+  data: Array<{ createdAt: string; total: number }>;
+  /** Per-day cash totals in pennies; `createdAt` is a `YYYY-MM-DD` day-string. */
+  cashData: Array<{ createdAt: string; total: number }>;
+  totalSum: number;
+  cashCents: number;
+}
+
+/**
+ * The signed-in viewer as the host projects it for a block on the wire in
+ * `VIEWER_RESULT` (the host-mediated `GET_VIEWER` self-read).
+ *
+ * Mirrors civitai/civitai's `blocks.getMyViewer` projection
+ * (`src/server/routers/blocks.router.ts`, PR #3152) — keep in lockstep. Distinct
+ * from the BLOCK_INIT-embedded {@link ViewerInfo}: `status` is the narrow
+ * spendable/mutable pair (`'active' | 'muted'` — a `banned` viewer can't read at
+ * all, so the read fails rather than returning `status: 'banned'`). The read is
+ * token-bound: only a signed-in viewer resolves; an anonymous / banned token
+ * comes back as the `VIEWER_RESULT` free-text `error` instead.
+ *
+ * NULLABILITY: both `username` and `buzzBudget` are present-but-NULLABLE, not
+ * omitted. The host returns `username: null` for a viewer with no handle and
+ * `buzzBudget: null` when the block token lacks the budget claim — the fields are
+ * always present on a success reply. Consumers (and the trust-boundary guard)
+ * MUST accept `null` for both; the block handles the null case.
+ */
+export interface BlockViewer {
+  id: number;
+  username: string | null;
+  status: 'active' | 'muted';
+  /** The viewer's current Buzz budget, or `null` when the token lacks the claim. */
+  buzzBudget: number | null;
+}
+
+/**
+ * The DISCRIMINATED error enum a `WILDCARD_PACK_RESULT` carries on failure —
+ * mirror civitai/civitai's `WildcardPackErrorCode`
+ * (`src/components/AppBlocks/wildcardPackParse.ts`) EXACTLY. Unlike the buzz
+ * bridges' free-text `error`, the wildcard bridge's error is one of these five
+ * codes: `not-found`/`forbidden` (the resolve proc's gates), `too-large` (the
+ * pre-download or inflation cap), `parse-failed` (fetch/unzip/parse/abort), and
+ * `busy` (host-side per-tab concurrency backpressure — the block should retry).
+ */
+export type BlockWildcardPackErrorCode =
+  | 'not-found'
+  | 'forbidden'
+  | 'too-large'
+  | 'parse-failed'
+  | 'busy';
+
+/**
+ * A parsed wildcard pack the host resolves + fetches + unzips + parses AS THE
+ * USER and returns on `WILDCARD_PACK_RESULT`. Mirrors civitai/civitai's
+ * `ResolveWildcardPackResult` `meta` + `maturity` spread with the parsed prompt
+ * lists (`src/server/services/wildcard-pack.service.ts` +
+ * `src/components/AppBlocks/PageBlockHost.tsx`) — keep in lockstep. `lists` maps
+ * each list name (`clothing/tops`) to its options; `truncated`/`truncatedLists`
+ * flag caps that were hit (anti-zip-bomb / result caps); `maturity` is the
+ * viewer's authoritative ceiling.
+ */
+export interface BlockWildcardPack {
+  modelId: number;
+  modelVersionId: number;
+  modelName: string;
+  versionName: string;
+  creatorUsername: string | null;
+  /** List name → its options (e.g. `{ 'clothing/tops': ['tee', 'hoodie'] }`). */
+  lists: Record<string, string[]>;
+  /** True when ANY cap (entries / bytes / options / chars / yaml traversal) was hit. */
+  truncated: boolean;
+  /** The names of the lists whose OWN options were capped/char-truncated. */
+  truncatedLists: string[];
+  maturity: {
+    /** The viewer's authoritative browsing-level ceiling (flag bitmask). */
+    browsingLevel: number;
+    /** True when that ceiling permits no mature content. */
+    sfwOnly: boolean;
+  };
+}
+
+// ============================================================
+// App generator SUBQUEUE (QUERY_APP_WORKFLOWS / CANCEL_APP_WORKFLOW)
+// ============================================================
+
+/**
+ * One result image on an {@link AppWorkflow}. Mirrors civitai/civitai's
+ * `AppWorkflowImage` projection (`src/server/services/blocks/workflow.service.ts`,
+ * PR #3164) — keep in lockstep. Only `available` blobs with a non-null url are
+ * surfaced by the host (pending/blocked blobs are dropped rather than handing the
+ * block dead links). `width`/`height` are `null` until the orchestrator populates
+ * them; `nsfwLevel` is the numeric civitai browsing-level bitflag (1/2/4/8/16),
+ * `null` for an unrated blob.
+ */
+export interface AppWorkflowImage {
+  url: string;
+  width: number | null;
+  height: number | null;
+  nsfwLevel: number | null;
+}
+
+/**
+ * The clean, wire-stable projection of ONE orchestrator workflow in the calling
+ * app's own generator SUBQUEUE — what `QUERY_APP_WORKFLOWS` / `CANCEL_APP_WORKFLOW`
+ * return. Mirrors civitai/civitai's `AppWorkflow` / `projectAppWorkflow`
+ * (`src/server/services/blocks/workflow.service.ts`, PR #3164) EXACTLY — KEEP IN
+ * LOCKSTEP; a drift here silently strands the reply's transport validator.
+ *
+ * The host deliberately DROPS every internal/sensitive workflow field (steps,
+ * params, prompts, resources, tokens, transactions, metadata, tags) so a block
+ * can never read generation internals of a queue it only owns by tag.
+ *
+ *   status:    the block-contract status — the orchestrator's
+ *              `unassigned`/`preparing`/`scheduled` all collapse to `pending`.
+ *   images:    only `available` blobs with a non-null url (see {@link AppWorkflowImage}).
+ *   cost:      the workflow's realized/estimated buzz total, or `null` when absent.
+ *   createdAt: ISO-8601 string.
+ */
+export interface AppWorkflow {
+  workflowId: string;
+  status: 'pending' | 'processing' | 'succeeded' | 'failed' | 'expired' | 'canceled';
+  images: AppWorkflowImage[];
+  cost: number | null;
+  /** ISO-8601. */
+  createdAt: string;
+  /**
+   * The Civitai model a training run in this workflow was published as —
+   * present once the viewer has started or finished publishing it through the
+   * model wizard. Same shape and meaning as
+   * {@link BlockWorkflowSnapshot.publishedModel}.
+   *
+   * 🔴 REQUIRES A HOST VERSION THAT EMITS IT. Absent on older hosts, and on
+   * every workflow nobody has published.
+   */
+  publishedModel?: BlockPublishedModel;
+  /**
+   * The epochs of a pass-through `training` / `imageResourceTraining` step in
+   * this workflow that produced a checkpoint. Same shape and rule as
+   * {@link BlockWorkflowSnapshot.trainedEpochs}: only runs whose training
+   * moderation status is approved are listed, the checkpoint itself is not
+   * exposed, and the field is OMITTED when there are no epochs to list. Lets a
+   * block offer "publish epoch n" from its queue without polling each run.
+   *
+   * 🔴 REQUIRES A HOST VERSION THAT EMITS IT. Absent on older hosts — treat
+   * absence as "unknown", not as "no checkpoint".
+   */
+  trainedEpochs?: BlockTrainedEpoch[];
+}
+
+// ============================================================
+// Gated per-viewer image read (GET_IMAGES_BY_IDS / IMAGES_RESULT)
+// ============================================================
+
+/**
+ * Per-viewer gated projection of ONE image returned by `GET_IMAGES_BY_IDS`
+ * (`IMAGES_RESULT`). The host applies the REQUESTING VIEWER's browsing-level
+ * clamp server-side, so the shape a viewer receives depends on THEIR ceiling:
+ *
+ *  - `status: 'visible'` — the viewer may see the pixels. TWO shapes live under
+ *    this one status:
+ *      · a RATED image — the full moderated projection
+ *        (`nsfwLevel`/`contentRating`/`url`, plus `width`/`height` for layout);
+ *      · an image NOTHING HAS RATED YET, returned ONLY to its own author, with
+ *        `ratingPending: true` and NEITHER `nsfwLevel` NOR `contentRating`.
+ *  - `status: 'hidden'` — the image EXISTS but is withheld from THIS viewer
+ *    (above their browsing ceiling, flagged, scan-refused, or — for everyone who
+ *    is not its author — not yet rated). NO `url` is ever returned; the block
+ *    renders a blurred/placeholder cell. This is the load-bearing cross-user
+ *    moderation boundary: an unclamped edge URL never crosses to a viewer who
+ *    can't see the image.
+ *
+ * 🔴 `nsfwLevel` AND `contentRating` ARE OPTIONAL, AND A MISSING ONE IS NOT "G".
+ * They were required until 0.42.0, and a block that dereferenced them on a
+ * `visible` entry now reads `undefined` for an author's own pending image. That
+ * absence IS the fix. `hidden` used to mean both "a rating exists and it is not
+ * for you" AND "nothing has rated this yet", so a block had ONE token to render
+ * and guessed maturity: an image published seconds earlier came back `hidden`
+ * and was displayed as *"Hidden — rated mature"* — a rating claim about an
+ * unrated image, which a page reload contradicted the moment the scan landed.
+ * Branch on `ratingPending` (or on `nsfwLevel === undefined`) and render a
+ * "still processing" affordance; NEVER substitute a default rating.
+ *
+ * 🔴 THE HOST DELIBERATELY DOES NOT DISTINGUISH "UNRATED" FROM "ABOVE YOUR
+ * CEILING" FOR SOMEONE ELSE'S IMAGE. Both are `hidden`. Reporting them apart
+ * would let a SFW viewer of a shared grid enumerate which cells are
+ * mature-or-flagged rather than merely unscanned, so there is no third status
+ * and no way to ask.
+ *
+ * Image ids the host cannot resolve to a benchmark-eligible bare Image row are
+ * OMITTED from the result entirely (neither visible nor hidden).
+ *
+ * Mirrors civitai/civitai's gated-read projection in
+ * `src/server/services/blocks/block-gated-images.service.ts` — keep in lockstep.
+ * That lockstep is now ENFORCED from the other side: civitai vendors this exact
+ * declaration in `src/server/services/blocks/blockGatedImageSdkParity.ts` and
+ * fails its typecheck when the two disagree. Change this type and that file has
+ * to move in the same landing.
+ */
+export type BlockGatedImage =
+  | {
+      imageId: number;
+      status: 'visible';
+      /** Scanner-resolved NSFW-level bitmask value. ABSENT on a `ratingPending` entry. */
+      nsfwLevel?: number;
+      /** Off-site content rating (`'g'|'pg'|'pg13'|'r'|'x'`). ABSENT on a `ratingPending` entry. */
+      contentRating?: ContentRating;
+      /** Civitai-hosted image URL (only present for a viewer allowed to see it). */
+      url: string;
+      width: number | null;
+      height: number | null;
+      /** Present ONLY on the viewer's OWN image that nothing has rated yet. */
+      ratingPending?: true;
+    }
+  | {
+      imageId: number;
+      status: 'hidden';
+    };
+
+// ============================================================
+// Collection follow bridge (SET_COLLECTION_FOLLOW)
+// ============================================================
+
+/**
+ * The CLOSED set of HOST-side refusal codes a `COLLECTION_FOLLOW_RESULT` carries
+ * on `error`. Mirror civitai/civitai's `CollectionFollowRefusal`
+ * (`src/components/AppBlocks/collectionFollowGate.ts`) EXACTLY — the host's gate
+ * is the definition and this is the copy.
+ *
+ * 🔴 A SERVER failure is NOT in this set. The host forwards the thrown error's
+ * own message verbatim (e.g. a `FORBIDDEN` from the collection service for a
+ * private collection), so `error` is a union of these codes and arbitrary
+ * free-text. Consumers must therefore test for a code by EQUALITY against a
+ * member of this set and treat anything else as an opaque server message —
+ * never assume the string is one of these.
+ *
+ * - `invalid-request` — the payload was malformed (non-integer / non-positive
+ *   `collectionId`, non-boolean `follow`). A block bug, not a viewer outcome.
+ * - `sign-in-required` — no session. The parity with the HTTP endpoint's 403 for
+ *   an anonymous block token; route it into `useRequestSignIn()`.
+ * - `review-mode` — a PENDING app under moderator review with "run for real" off.
+ *   The op is session-authed, so it must not drive the reviewing mod's account.
+ * - `not-ready` — the host has not finished the block handshake, so there has
+ *   been no interaction this prompt could belong to. Retry after `ready`.
+ * - `declined` — the viewer DISMISSED the host's consent confirm. 🔴 NOT an
+ *   error: it means no write occurred, and the host takes a consent latch
+ *   synchronously before the write so this can never be reported for a follow
+ *   that did happen. Render nothing, or a quiet revert.
+ * - `collection-unavailable` — the host could not resolve the collection's
+ *   identity: it does not exist, the viewer may not see it, the lookup failed,
+ *   OR the block exhausted its per-instance distinct-id lookup budget (20).
+ *   🔴 ONE code for all four, DELIBERATELY — a distinct "not found" or "rate
+ *   limited" would let a block enumerate private collection ids by asking the
+ *   host to name them. Do not branch on it for anything but "we cannot act on
+ *   this id".
+ */
+export type BlockCollectionFollowErrorCode =
+  | 'invalid-request'
+  | 'sign-in-required'
+  | 'review-mode'
+  | 'not-ready'
+  | 'declined'
+  | 'collection-unavailable';
+
+/**
+ * The success payload of a `COLLECTION_FOLLOW_RESULT` — the host's echo of what
+ * it actually wrote.
+ *
+ * `followed` is the state AFTER the write, echoed from the request's `follow`,
+ * so a block should adopt this value rather than assuming its own optimistic
+ * one held: the two agree today, and reading the echo is what keeps the block
+ * correct if a host ever settles differently.
+ */
+export interface BlockCollectionFollowResult {
+  collectionId: number;
+  /** `true` ⇒ the viewer now follows the collection; `false` ⇒ no longer does. */
+  followed: boolean;
+}
+
+// ============================================================
+// App Blocks → Post bridge (CREATE_POST_FROM_APP)
+// ============================================================
+
+/**
+ * ONE image source for {@link BlockCreatePostRequest}.
+ *
+ * 🔴 NEITHER ARM CARRIES A URL, AND THAT IS THE POINT. A block is a sandboxed
+ * iframe; if it could name the bytes, "post the app's own outputs" would mean
+ * "post anything". So a source names either an INDEX into the host's own ordered
+ * projection of a workflow it already proved the app owns, or an `Image` id the
+ * server re-verifies (owner + this app's provenance marker + not already in a
+ * post). Both resolve server-side; a block can only choose among bytes the
+ * platform already attributed to it.
+ *
+ * Two kinds rather than one, by operator decision: an app that publishes to its
+ * shared grid first and then lets the viewer post the one they like cannot be
+ * built on fresh workflow outputs alone.
+ *
+ * ⚠️ POSTING A PUBLISHED IMAGE REMOVES IT FROM THE APP'S OWN GRID. The app-scoped
+ * read of previously-published images is conjoined with `postId IS NULL`, so an
+ * image that joins a post stops resolving through `useGatedImages()`. An app
+ * cannot both keep an image in its shared grid and let the viewer post it; plan
+ * the UI for that rather than being surprised by it.
+ */
+export type BlockPostSource =
+  | {
+      kind: 'workflow';
+      /** A workflow from this app's OWN subqueue (see `useAppWorkflows()`). */
+      workflowId: string;
+      /**
+       * Indexes into that workflow's `images`, as seen via `useAppWorkflows()`.
+       * Omit to take every available output.
+       */
+      imageIndexes?: number[];
+    }
+  | {
+      kind: 'published';
+      /** Ids returned by a previous `usePublishGenerationOutputs()` publish. */
+      imageIds: number[];
+    };
+
+/**
+ * The request a block makes of the host in `CREATE_POST_FROM_APP`, minus the
+ * transport's own `requestId`.
+ *
+ * Every text field here is ADVISORY. The server bounds `title`/`detail`, screens
+ * them against the blocked-content list, refuses a `detail` containing a link,
+ * and resolves `tags` against EXISTING tags only — a name matching no tag is
+ * dropped, never minted, and is reported back to the VIEWER on the consent
+ * screen rather than silently discarded. The host's confirm renders the server's
+ * resolution of this request, never these strings.
+ */
+export interface BlockCreatePostRequest {
+  /** Image sources, in POST ORDER. At least one. */
+  sources: BlockPostSource[];
+  title?: string;
+  detail?: string;
+  /** Requested tag NAMES. Existing tags only; unmatched names are dropped. */
+  tags?: string[];
+  /**
+   * Optional model-version gallery attach. Gated hard server-side (the version
+   * must be published and public, and an app may not attach to its own
+   * publisher's models). The viewer is told about the attach explicitly.
+   */
+  modelVersionId?: number;
+}
+
+/**
+ * The success payload of a `CREATE_POST_RESULT` — the post the host actually
+ * created.
+ */
+export interface BlockCreatePostResult {
+  postId: number;
+  /** The post's URL on civitai. */
+  url: string;
+  /**
+   * The ids of the images the post is made of, in post order. A `published`
+   * source contributes the id it named; a `workflow` source contributes the id
+   * of the `Image` row this call created for it.
+   */
+  imageIds: number[];
+}
+
+/**
+ * The HOST'S OWN refusal codes on a `CREATE_POST_RESULT`'s `error`.
+ *
+ * 🔴 THIS IS THE SET A BLOCK MAY RELY ON, NOT THE SET IT MAY RECEIVE. `error` is
+ * a UNION of these codes and arbitrary free text: the host forwards any server
+ * message verbatim (a rate limit, a blocked title, a refused gallery attach, a
+ * write-trust refusal). Test for a code by EQUALITY against a member of this set
+ * and treat anything else as an opaque server message. The SDK's inbound
+ * validator shape-checks `error` and deliberately does NOT constrain it to this
+ * set — doing so would drop every server failure at the transport and wedge the
+ * block for the full ten-minute consent timeout.
+ *
+ * Mirrors civitai/civitai's `CREATE_POST_HOST_ERRORS`
+ * (`src/components/AppBlocks/createPostFromAppGate.ts`) — the host's gate is the
+ * definition and this is the copy.
+ *
+ * - `review-mode` — a mod-review sandbox with "run for real" off. A review token
+ *   can never carry `posts:write:self`, so the post could not happen anyway.
+ * - `block is not ready` — the host handshake has not completed. Retry after
+ *   `ready`.
+ * - `sign in to post` — anonymous viewer; there is no profile to post to. Route
+ *   into `useRequestSignIn()`.
+ * - `no images to post` — the payload named no sources, or the server resolved
+ *   none of them.
+ * - `no block token` — the host holds no block token yet.
+ * - `declined` — the viewer dismissed the consent confirm. 🔴 GUARANTEED to mean
+ *   NO POST WAS CREATED: the host takes a consent latch synchronously before the
+ *   write, so a dismissal mid-write can never claim this code.
+ */
+export type BlockCreatePostHostError =
+  | 'review-mode'
+  | 'block is not ready'
+  | 'sign in to post'
+  | 'no images to post'
+  | 'no block token'
+  | 'declined';
+
+// ============================================================
+// App Blocks training bridges (PREPARE_TRAINING_DATASET / RUN_TRAINING)
+// ============================================================
+
+/**
+ * One image of a training dataset request — an `Image` id the VIEWER owns, and
+ * the caption to train it with.
+ *
+ * Host bounds (`blockTrainingDatasetItemsSchema`): `imageId` a positive integer,
+ * `caption` at most {@link BLOCK_TRAINING_CAPTION_MAX_CHARS} characters, no other
+ * keys; 1…{@link BLOCK_TRAINING_DATASET_MAX_ITEMS} items per request. A payload
+ * outside them is refused by the host with `invalid training dataset` before any
+ * server call. Captions are moderated like prompts.
+ */
+export interface BlockTrainingDatasetItem {
+  imageId: number;
+  caption: string;
+}
+
+/**
+ * Why the server left an image out of a prepared dataset. Mirrors
+ * civitai/civitai's `BlockTrainingRejectionReason`.
+ *
+ * - `unavailable` — not found, OR not the viewer's own image. One reason for
+ *   both, on purpose: the server will not tell an app whether someone else's
+ *   image id exists.
+ * - `unsupported-media` — a video or audio row.
+ * - `not-eligible` — refused by moderation state or the page's maturity ceiling.
+ * - `pending-scan` — not scanned yet; retry once the scan finishes.
+ * - `import-failed` — the orchestrator did not accept the image.
+ * - `import-unavailable` — the import timed out or the orchestrator was
+ *   unavailable; retryable.
+ *
+ * The SDK's inbound validator checks `reason` only as a STRING, so a reason the
+ * host adds later still arrives — give an exhaustive `switch` a default branch.
+ */
+export type BlockTrainingRejectionReason =
+  | 'unavailable'
+  | 'unsupported-media'
+  | 'not-eligible'
+  | 'pending-scan'
+  | 'import-failed'
+  | 'import-unavailable';
+
+/**
+ * The success payload of `TRAINING_DATASET_RESULT` — what
+ * `usePrepareTrainingDataset().prepareDataset()` resolves with.
+ */
+export interface BlockTrainingDatasetResult {
+  /**
+   * Opaque handle for {@link WorkflowBodyTraining.datasetId} (`tds_` + 32 hex
+   * characters), bound to this viewer, app and install.
+   */
+  datasetId: string;
+  /**
+   * How many images were ADMITTED — always at least 1: when nothing is admitted
+   * the server refuses the request instead of returning an empty dataset. The
+   * server derives it; a run trains on exactly these.
+   */
+  count: number;
+  /** The images left out, each with its reason. Empty when every image was admitted. */
+  rejected: Array<{ imageId: number; reason: BlockTrainingRejectionReason }>;
+}
+
+/**
+ * The HOST'S OWN refusal codes on a `TRAINING_DATASET_RESULT`'s `error`. Mirrors
+ * civitai/civitai's `PREPARE_TRAINING_DATASET_HOST_ERRORS`
+ * (`src/components/AppBlocks/prepareTrainingDatasetGate.ts`, civitai/civitai#5438).
+ *
+ * 🔴 THE SET A BLOCK MAY RELY ON, NOT THE SET IT MAY RECEIVE: `error` also carries
+ * any server message verbatim (`training from apps is not enabled`, a rate limit,
+ * a moderation refusal of a caption). Compare by EQUALITY against these members
+ * and treat anything else as an opaque server message.
+ *
+ * - `review-mode` — a mod-review sandbox with "run for real" off.
+ * - `block is not ready` — the host handshake has not completed.
+ * - `sign in to train` — anonymous viewer; there are no images of theirs to read.
+ * - `invalid training dataset` — `items` failed the host's item schema (shape,
+ *   count or caption length). Nothing was sent to the server.
+ * - `no block token` — the host holds no block token yet.
+ */
+export type BlockPrepareTrainingDatasetHostError =
+  | 'review-mode'
+  | 'block is not ready'
+  | 'sign in to train'
+  | 'invalid training dataset'
+  | 'no block token';
+
+/**
+ * The HOST'S OWN refusal codes on a `TRAINING_RESULT`'s `error`. Mirrors
+ * civitai/civitai's `RUN_TRAINING_HOST_ERRORS`
+ * (`src/components/AppBlocks/runTrainingGate.ts`).
+ *
+ * 🔴 THE SET A BLOCK MAY RELY ON, NOT THE SET IT MAY RECEIVE: server messages
+ * (an expired or already-used quote, a body that differs from the quoted one, an
+ * ineligible dataset image) arrive verbatim in the same field.
+ *
+ * - `review-mode` — a mod-review sandbox with "run for real" off.
+ * - `block is not ready` — the host handshake has not completed.
+ * - `sign in to train` — anonymous viewer; there is no account to charge.
+ * - `invalid training request` — the body is not a `kind: 'training'` body
+ *   naming a `quoteId`.
+ * - `no block token` — the host holds no block token yet.
+ * - `declined` — the viewer dismissed the consent dialog. 🔴 GUARANTEED to mean
+ *   NO RUN WAS SUBMITTED.
+ * - `submission-unconfirmed` — the submit was SENT but its outcome is unknown
+ *   (the connection dropped, or the server attempted the run and could not
+ *   confirm it). 🔴 The run MAY BE RUNNING AND CHARGED. Check the viewer's
+ *   trainings (`useAppWorkflows()`, or send them to their Training page) before
+ *   offering a retry — a retry of the same body after the server did start the
+ *   run is a SECOND, separately charged run.
+ */
+export type BlockRunTrainingHostError =
+  | 'review-mode'
+  | 'block is not ready'
+  | 'sign in to train'
+  | 'invalid training request'
+  | 'no block token'
+  | 'declined'
+  | 'submission-unconfirmed';
