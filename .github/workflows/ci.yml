@@ -1,0 +1,138 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  sdk:
+    name: SDK (typecheck + test + build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm --filter @civitai/app-sdk typecheck
+      - run: pnpm --filter @civitai/app-sdk test
+      - run: pnpm --filter @civitai/app-sdk build
+
+  blocks-react:
+    name: blocks-react (typecheck + test + build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # blocks-react consumes @civitai/app-sdk via workspace:^ and resolves
+      # types from its dist/. Build the SDK first so the package isn't
+      # typechecking against stale or missing declarations.
+      - run: pnpm --filter @civitai/app-sdk build
+
+      - run: pnpm --filter @civitai/blocks-react typecheck
+      - run: pnpm --filter @civitai/blocks-react test
+      - run: pnpm --filter @civitai/blocks-react build
+
+      # Real-browser (vitest browser mode) perf/layout tests for the dev:live
+      # picker overlay — happy-dom can't lay out, decode images, or run
+      # IntersectionObserver/PerformanceObserver, so these run in headless
+      # Chromium. Install Playwright's bundled Chromium + its OS deps first.
+      # (CI uses the bundled binary; NixOS local runs set
+      # PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=$(command -v chromium) instead.)
+      - run: pnpm --filter @civitai/blocks-react exec playwright install --with-deps chromium
+      - run: pnpm --filter @civitai/blocks-react test:browser
+
+  blocks-cli:
+    name: blocks-cli (typecheck + test + build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # blocks-cli imports `defineBlock` + `BLOCK_SCOPES` from
+      # @civitai/app-sdk/blocks (workspace:^) — SDK must be built first so
+      # the .d.ts is current.
+      - run: pnpm --filter @civitai/app-sdk build
+
+      - run: pnpm --filter @civitai/blocks-cli typecheck
+      - run: pnpm --filter @civitai/blocks-cli test
+      - run: pnpm --filter @civitai/blocks-cli build
+
+  starter:
+    name: Starter
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        starter:
+          - next-app
+          - sveltekit-app
+          - react-pwa
+          - svelte-pwa
+          - civitai-block-starter
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # Starters consume @civitai/app-sdk via workspace:^ (and the block
+      # starter additionally consumes @civitai/blocks-react). Building all
+      # packages up front so each starter's typecheck sees fresh .d.ts files.
+      - run: pnpm -r --filter "./packages/*" build
+
+      - name: Typecheck
+        run: pnpm --filter ./starters/${{ matrix.starter }} typecheck
+
+      - name: Build
+        # Each starter's env helper bails on missing CIVITAI_CLIENT_ID etc.
+        # CI doesn't have real secrets; SKIP_ENV_VALIDATION turns the bailout
+        # off so the build verifies code compiles, not that env is wired.
+        run: pnpm --filter ./starters/${{ matrix.starter }} build
+        env:
+          SKIP_ENV_VALIDATION: '1'
+
+      - name: Lint (if defined)
+        run: |
+          if pnpm --filter ./starters/${{ matrix.starter }} exec node -e "process.exit(require('./package.json').scripts?.lint ? 0 : 1)" 2>/dev/null; then
+            pnpm --filter ./starters/${{ matrix.starter }} lint
+          else
+            echo "No lint script for ${{ matrix.starter }} — skipping."
+          fi
