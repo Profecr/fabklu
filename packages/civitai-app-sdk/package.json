@@ -1,0 +1,78 @@
+{
+  "name": "@civitai/app-sdk",
+  "version": "0.10.0",
+  "description": "OAuth + PKCE, encrypted-cookie sessions, scopes, and orchestrator helpers for building third-party Civitai apps.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./oauth": {
+      "types": "./dist/oauth/index.d.ts",
+      "import": "./dist/oauth/index.js"
+    },
+    "./scopes": {
+      "types": "./dist/scopes/index.d.ts",
+      "import": "./dist/scopes/index.js"
+    },
+    "./cookies": {
+      "types": "./dist/cookies/index.d.ts",
+      "import": "./dist/cookies/index.js"
+    },
+    "./orchestrator": {
+      "types": "./dist/orchestrator/index.d.ts",
+      "import": "./dist/orchestrator/index.js"
+    },
+    "./blocks": {
+      "types": "./dist/blocks/index.d.ts",
+      "import": "./dist/blocks/index.js"
+    },
+    "./schemas/app-block/v1.json": "./schemas/app-block/v1.json"
+  },
+  "files": [
+    "dist",
+    "schemas",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test:types": "tsc -p tsconfig.typecheck.json",
+    "test": "vitest run && tsc -p tsconfig.typecheck.json",
+    "test:watch": "vitest"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "typescript": "^5.9.2",
+    "vitest": "^4.1.7"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "civitai",
+    "oauth",
+    "pkce",
+    "sdk",
+    "orchestrator",
+    "ai",
+    "generation",
+    "session",
+    "encrypted-cookie"
+  ],
+  "homepage": "https://github.com/civitai/civitai-app-starters/tree/main/packages/civitai-app-sdk#readme",
+  "bugs": "https://github.com/civitai/civitai-app-starters/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/civitai/civitai-app-starters.git",
+    "directory": "packages/civitai-app-sdk"
+  }
+}
