@@ -1,0 +1,36 @@
+docs/working/
+
+node_modules/
+dist/
+build/
+.next/
+.svelte-kit/
+.vercel/
+.turbo/
+.cache/
+coverage/
+
+.env
+.env.local
+.env.*.local
+
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/settings.json.example
+
+.claude/settings.local.json
+
+*.tsbuildinfo
+.eslintcache
+
+# Scratch dir for scripts/typecheck-readme-snippets.mjs (auto-cleaned; ignored
+# in case a run is interrupted mid-flight).
+.readme-snippets-tmp/
