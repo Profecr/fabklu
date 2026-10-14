@@ -1,0 +1,31 @@
+---
+description: Add an OAuth scope to the bitmask the app requests at login
+---
+
+Add OAuth scope `$ARGUMENTS` (e.g. `MediaRead`, `MediaWrite`, `ModelsRead`).
+
+## Files to touch
+
+1. **`src/lib/scopes.ts`** — add the new scope name to the
+   existing `REQUESTED_SCOPES` list, matching the names already there.
+
+2. **`README.md`** — update the "Register a Civitai OAuth App" scopes list.
+
+3. **`.env.example`** — if any scope-specific env is needed, document it.
+
+## Re-consent
+
+Existing user sessions don't pick up the new scope. After deploying:
+
+- Tell users to **log out and back in** to re-consent, or
+- Bump `SESSION_SECRET` to force-invalidate all sessions (heavy-handed).
+
+## Verify
+
+```
+pnpm typecheck
+pnpm dev          # click "Sign in"; the consent screen must list the new scope
+pnpm test:e2e -- auth-flow
+```
+
+See [AGENTS.md › Verifying changes](../../AGENTS.md#verifying-changes).
