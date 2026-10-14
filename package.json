@@ -1,0 +1,50 @@
+{
+  "name": "civitai-app-starters",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Starter templates and shared SDK for building apps on Civitai.",
+  "packageManager": "pnpm@10.28.1",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "pnpm -r --filter \"./packages/*\" build",
+    "test": "pnpm -r --filter \"./packages/*\" test",
+    "typecheck": "pnpm -r --filter \"./packages/*\" typecheck",
+    "lint": "pnpm -r --filter \"./packages/*\" lint",
+    "e2e:all": "node scripts/run-all-e2e.mjs",
+    "typecheck:readme": "node scripts/typecheck-readme-snippets.mjs",
+    "check:schema": "bash scripts/check-canonical-schema.sh",
+    "check:starter-pins": "node scripts/check-starter-pins.mjs",
+    "changeset": "changeset",
+    "release": "pnpm -r --filter \"./packages/*\" build && changeset publish",
+    "release:check": "changeset status --verbose"
+  },
+  "license": "MIT",
+  "keywords": [
+    "civitai",
+    "oauth",
+    "pkce",
+    "starter",
+    "template",
+    "ai",
+    "generation",
+    "monorepo"
+  ],
+  "homepage": "https://github.com/civitai/civitai-app-starters#readme",
+  "bugs": "https://github.com/civitai/civitai-app-starters/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/civitai/civitai-app-starters.git"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.27.10"
+  },
+  "pnpm": {
+    "overrides": {
+      "@civitai/app-sdk": "workspace:*",
+      "cookie@<0.7.0": "^0.7.0",
+      "postcss@<8.5.10": ">=8.5.10"
+    }
+  }
+}
